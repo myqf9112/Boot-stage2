@@ -1,0 +1,29 @@
+# EditorConfig https://EditorConfig.org
+root = true
+
+# C源文件 & 头文件
+[*.{c,h}]
+indent_style = space
+indent_size = 4
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# 汇编文件 .S
+[*.S]
+indent_style = space
+indent_size = 4
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# Makefile / shell脚本 使用Tab缩进
+[{Makefile,*.sh}]
+indent_style = tab
+indent_size = 4
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
