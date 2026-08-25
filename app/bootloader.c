@@ -440,14 +440,8 @@ static bool key_trap_check(void)
         tim_delay_ms(10);
         if (!key_read(key1))
             return false;
-
-        if (!rb_empty(rxrb))
-        {
-            log_d("serial data received, trap into boot");
-            return true;
-        }
     }
-    log_w("timeout, trap into boot");
+    log_w("key pressed, trap into boot");
     return true;
 }
 
@@ -481,7 +475,22 @@ bool magic_header_trap_boot(void)
     if (!application_validate())
     {
         log_e("Application invalid, trap into bootloader");
-        return true; 
+        return true;
+    }
+
+    return false;
+}
+
+bool rx_trap_boot(void)
+{
+    for (uint32_t i = 0; i < BOOT_DELAY; i += 10)
+    {
+        tim_delay_ms(10);
+        if (!rb_empty(rxrb))
+        {
+            log_w("data received, trap into boot");
+            return true;
+        }
     }
 
     return false;
@@ -498,14 +507,15 @@ void bootloader_main(void)
 
     bool trapboot = false;
 
-    if (!trapboot)
-        trapboot = magic_header_trap_boot();
-
-    if (!trapboot)
+ if (!trapboot)
         trapboot = key_trap_check();
 
     if (!trapboot)
+        trapboot = rx_trap_boot();
+
+    if (!trapboot)
         boot_application();
+
     led_init(led1);
     led_on(led1);
     wait_key_release();
