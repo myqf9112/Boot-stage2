@@ -39,8 +39,7 @@ static void SystemClock_Config(void)
 
     /* Switch SYSCLK to PLL */
     LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_PLL);
-    while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL)
-        ;
+    while (LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_PLL);
 
     /* Update SystemCoreClock variable */
     SystemCoreClockUpdate();

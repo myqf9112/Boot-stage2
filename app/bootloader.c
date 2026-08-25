@@ -500,7 +500,6 @@ void bootloader_main(void)
 {
     log_i("Bootloader started.\r");
     key_init(key1);
-
     rxrb = rb_new(rb_buffer, RX_BUFFER_SIZE);
     bl_usart_init();
     bl_usart_register_rx_callback(bl_usart_rx_handler);

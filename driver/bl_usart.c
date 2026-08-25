@@ -13,9 +13,6 @@ static bl_usart_rx_callback_t rx_callback;
 
 static void usart_io_init(void)
 {
-    LL_GPIO_SetAFPin_8_15(GPIOB, LL_GPIO_PIN_10, LL_GPIO_AF_7);
-    LL_GPIO_SetAFPin_8_15(GPIOB, LL_GPIO_PIN_11, LL_GPIO_AF_7);
-
     LL_GPIO_InitTypeDef GPIO_InitStruct;
     LL_GPIO_StructInit(&GPIO_InitStruct);
 
@@ -24,6 +21,7 @@ static void usart_io_init(void)
     GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
     GPIO_InitStruct.Pull = LL_GPIO_PULL_UP;
+    GPIO_InitStruct.Alternate = LL_GPIO_AF_7;
     LL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
@@ -108,6 +106,8 @@ static void usart_lowlevel_init(void)
     USART_InitStruct.HardwareFlowControl = LL_USART_HWCONTROL_NONE;
     LL_USART_Init(USART3, &USART_InitStruct);
     LL_USART_EnableIT_RXNE(USART3);
+    LL_USART_EnableDirectionTx(USART3);
+    LL_USART_EnableDirectionRx(USART3);
     LL_USART_Enable(USART3);
 }
 
