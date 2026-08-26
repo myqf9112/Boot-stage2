@@ -31,7 +31,8 @@
 #define APP_BASE_ADDRESS 0x08010000
 #define BL_ADDRESS 0x08000000
 #define BL_SIZE (48 * 1024) // 48KB bootloader size
-#define BOOT_DELAY 10000    // 10S boot delay (上位机连接窗口)
+#define BOOT_DELAY 3000    //  boot delay (上位机连接窗口)
+#define KEY_HOLD_TRAP_MS 1500 // 按键进入 bootloader 需连续按住的时间(ms)
 typedef enum
 {
     PACKET_STATE_HEADER,
@@ -444,14 +445,27 @@ static void bl_usart_rx_handler(const uint8_t *data, uint32_t length)
 
 static bool key_trap_check(void)
 {
-    for (uint32_t t = 0; t < BOOT_DELAY; t += 1)
+    /* 窗口内连续按住 key1 达到 KEY_HOLD_TRAP_MS 即进入 bootloader;
+     * 中途松开则重新计时,窗口结束未达到则正常启动 APP */
+    uint32_t held_ms = 0;
+    for (uint32_t t = 0; t < BOOT_DELAY; t += 10)
     {
-        tim_delay_ms(1);
-        if (!key_read(key1))
-            return false;
+        tim_delay_ms(10);
+        if (key_read(key1))
+        {
+            held_ms += 10;
+            if (held_ms >= KEY_HOLD_TRAP_MS)
+            {
+                log_w("key held %u ms, trap into boot", (unsigned)held_ms);
+                return true;
+            }
+        }
+        else
+        {
+            held_ms = 0;
+        }
     }
-    log_w("key pressed, trap into boot");
-    return true;
+    return false;
 }
 
 static void wait_key_release(void)
