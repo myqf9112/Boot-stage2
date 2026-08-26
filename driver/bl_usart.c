@@ -1,5 +1,6 @@
 #include "stm32f4xx_ll_gpio.h"
 #include "stm32f4xx_ll_usart.h"
+#include "stm32f4xx_ll_dma.h"
 #include "bl_usart.h"
 
 // USE USART3
@@ -9,7 +10,13 @@
 // BAUD: 115200
 // DMA: TX/RX
 
+#define DMA_RX_BUF_SIZE 8192 // DMA 环形接收缓冲
+
+static uint8_t dma_rx_buf[DMA_RX_BUF_SIZE] __attribute__((aligned(4)));
+static uint32_t dma_rx_last; // 已搬进环形缓冲的 DMA 位置
 static bl_usart_rx_callback_t rx_callback;
+
+static void usart_dma_rx_config(void);
 
 static void usart_io_init(void)
 {
@@ -25,72 +32,12 @@ static void usart_io_init(void)
     LL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
-// static void usart_dma_config(void)
-// {
-//     DMA_InitTypeDef DMA_InitStructure;
-//     DMA_StructInit(&DMA_InitStructure);
 
-//     // RX
-//     DMA_InitStructure.DMA_Channel = DMA_Channel_4;
-//     DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)&(USART3->DR);
-//     DMA_InitStructure.DMA_Memory0BaseAddr = 0; // set later
-//     DMA_InitStructure.DMA_DIR = DMA_DIR_PeripheralToMemory;
-//     DMA_InitStructure.DMA_BufferSize = 0; // set later
-//     DMA_InitStructure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
-//     DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Enable;
-//     DMA_InitStructure.DMA_PeripheralDataSize = DMA_MemoryDataSize_Byte;
-//     DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_Byte;
-//     DMA_InitStructure.DMA_Mode = DMA_Mode_Normal;
-//     DMA_InitStructure.DMA_Priority = DMA_Priority_Medium;
-//     DMA_InitStructure.DMA_FIFOMode = DMA_FIFOMode_Enable;
-//     DMA_InitStructure.DMA_FIFOThreshold = DMA_FIFOThreshold_Full;
-//     DMA_InitStructure.DMA_MemoryBurst = DMA_MemoryBurst_INC16;
-//     DMA_InitStructure.DMA_PeripheralBurst = DMA_PeripheralBurst_Single;
-//     DMA_Init(DMA1_Stream1, &DMA_InitStructure);
-//     // DMA_ITConfig(DMA1_Stream1, DMA_IT_TC, ENABLE);
-//     DMA_Cmd(DMA1_Stream1, DISABLE);
-
-//     // TX
-//     DMA_InitStructure.DMA_Channel = DMA_Channel_4;
-//     DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)&(USART3->DR);
-//     DMA_InitStructure.DMA_Memory0BaseAddr = 0; // set later
-//     DMA_InitStructure.DMA_DIR = DMA_DIR_MemoryToPeripheral;
-//     DMA_InitStructure.DMA_BufferSize = 0; // set later
-//     DMA_InitStructure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
-//     DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Enable;
-//     DMA_InitStructure.DMA_PeripheralDataSize = DMA_MemoryDataSize_Byte;
-//     DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_Byte;
-//     DMA_InitStructure.DMA_Mode = DMA_Mode_Normal;
-//     DMA_InitStructure.DMA_Priority = DMA_Priority_Medium;
-//     DMA_InitStructure.DMA_FIFOMode = DMA_FIFOMode_Enable;
-//     DMA_InitStructure.DMA_FIFOThreshold = DMA_FIFOThreshold_Full;
-//     DMA_InitStructure.DMA_MemoryBurst = DMA_MemoryBurst_INC16;
-//     DMA_InitStructure.DMA_PeripheralBurst = DMA_PeripheralBurst_Single;
-//     DMA_Init(DMA1_Stream3, &DMA_InitStructure);
-//     // DMA_ITConfig(DMA1_Stream3, DMA_IT_TC, ENABLE);
-//     DMA_Cmd(DMA1_Stream3, DISABLE);
-// }
 
 static void usart_it_config(void)
 {
     NVIC_EnableIRQ(USART3_IRQn);
     NVIC_SetPriority(USART3_IRQn, 5);
-
-    // // DMA TX
-    // NVIC_InitStructure.NVIC_IRQChannel = DMA1_Stream3_IRQn;
-    // NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 5;
-    // NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
-    // NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
-    // NVIC_Init(&NVIC_InitStructure);
-    // NVIC_SetPriority(DMA1_Stream3_IRQn, 5);
-
-    // // DMA RX
-    // NVIC_InitStructure.NVIC_IRQChannel = DMA1_Stream1_IRQn;
-    // NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 5;
-    // NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
-    // NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
-    // NVIC_Init(&NVIC_InitStructure);
-    // NVIC_SetPriority(DMA1_Stream1_IRQn, 5);
 }
 
 static void usart_lowlevel_init(void)
@@ -105,7 +52,7 @@ static void usart_lowlevel_init(void)
     USART_InitStruct.TransferDirection = LL_USART_DIRECTION_TX_RX;
     USART_InitStruct.HardwareFlowControl = LL_USART_HWCONTROL_NONE;
     LL_USART_Init(USART3, &USART_InitStruct);
-    LL_USART_EnableIT_RXNE(USART3);
+    LL_USART_EnableDMAReq_RX(USART3);
     LL_USART_EnableDirectionTx(USART3);
     LL_USART_EnableDirectionRx(USART3);
     LL_USART_Enable(USART3);
@@ -113,7 +60,7 @@ static void usart_lowlevel_init(void)
 
 void bl_usart_init(void)
 {
-    // usart_dma_config();
+    usart_dma_rx_config();
     usart_it_config();
     usart_lowlevel_init();
     usart_io_init();
@@ -127,17 +74,51 @@ void bl_usart_write(const uint8_t *data, uint32_t size)
         while (!LL_USART_IsActiveFlag_TC(USART3));
     }
 
-    // // DMA Tranfer 65536 bytes at most
-    // while (size > 0)
-    // {
-    //     uint32_t chunk = size > 65536 ? 65536 : size;
-    //     DMA1_Stream3->M0AR = (uint32_t)data;
-    //     DMA1_Stream3->NDTR = chunk;
-    //     DMA_Cmd(DMA1_Stream3, ENABLE);
-    //     while (DMA_GetCmdStatus(DMA1_Stream3) != DISABLE);
-    //     data += chunk;
-    //     size -= chunk;
-    // }
+
+}
+
+static void usart_dma_rx_config(void)
+{
+    /* DMA1 Stream1 Channel4 = USART3_RX (F407 固定映射),环形模式 */
+    LL_DMA_SetChannelSelection(DMA1, LL_DMA_STREAM_1, LL_DMA_CHANNEL_4);
+    LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_STREAM_1, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
+    LL_DMA_SetStreamPriorityLevel(DMA1, LL_DMA_STREAM_1, LL_DMA_PRIORITY_MEDIUM);
+    LL_DMA_SetMode(DMA1, LL_DMA_STREAM_1, LL_DMA_MODE_CIRCULAR);
+    LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_STREAM_1, LL_DMA_PERIPH_NOINCREMENT);
+    LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_STREAM_1, LL_DMA_MEMORY_INCREMENT);
+    LL_DMA_SetPeriphSize(DMA1, LL_DMA_STREAM_1, LL_DMA_PDATAALIGN_BYTE);
+    LL_DMA_SetMemorySize(DMA1, LL_DMA_STREAM_1, LL_DMA_MDATAALIGN_BYTE);
+    LL_DMA_SetDataLength(DMA1, LL_DMA_STREAM_1, DMA_RX_BUF_SIZE);
+    LL_DMA_ConfigAddresses(DMA1, LL_DMA_STREAM_1,
+                           (uint32_t)&USART3->DR,
+                           (uint32_t)dma_rx_buf,
+                           LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
+    LL_DMA_EnableStream(DMA1, LL_DMA_STREAM_1);
+}
+
+void bl_usart_flush_rx(void)
+{
+    /* 用 NDTR 算出 DMA 当前写入位置,把新收到的数据搬进上层环形缓冲 */
+    uint32_t remain = LL_DMA_GetDataLength(DMA1, LL_DMA_STREAM_1);
+    uint32_t pos = DMA_RX_BUF_SIZE - remain;
+    if (pos == dma_rx_last)
+        return;
+    if (!rx_callback)
+    {
+        dma_rx_last = pos;
+        return;
+    }
+    if (pos > dma_rx_last)
+    {
+        rx_callback(&dma_rx_buf[dma_rx_last], pos - dma_rx_last);
+    }
+    else
+    {
+        rx_callback(&dma_rx_buf[dma_rx_last], DMA_RX_BUF_SIZE - dma_rx_last);
+        if (pos > 0)
+            rx_callback(&dma_rx_buf[0], pos);
+    }
+    dma_rx_last = (pos == DMA_RX_BUF_SIZE) ? 0 : pos;
 }
 
 void bl_usart_register_rx_callback(bl_usart_rx_callback_t callback)
@@ -164,22 +145,3 @@ void USART3_IRQHandler(void)
     }
 }
 
-// // DMA1 Stream3 for USART3 TX
-// void DMA1_Stream3_IRQHandler(void)
-// {
-//     if (DMA_GetITStatus(DMA1_Stream3, DMA_IT_TC) != RESET)
-//     {
-
-//         DMA_ClearITPendingBit(DMA1_Stream3, DMA_IT_TC);
-//     }
-// }
-
-// // DMA1 Stream1 for USART3 RX
-// void DMA1_Stream1_IRQHandler(void)
-// {
-//     if (DMA_GetITStatus(DMA1_Stream1, DMA_IT_TC) != RESET)
-//     {
-
-//         DMA_ClearITPendingBit(DMA1_Stream1, DMA_IT_TC);
-//     }
-// }

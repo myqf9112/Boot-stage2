@@ -16,7 +16,7 @@ from protocol import (
     INQUERY_SUBCODE_VERSION, INQUERY_SUBCODE_MTU,
     ERR_OK, ERROR_NAMES,
     CHUNK_SIZE,
-    send_and_recv, crc32,
+    send_and_recv, send_packet, recv_response, _default_debug, crc32,
 )
 
 # STM32F407 Flash layout
@@ -69,11 +69,60 @@ def erase(ser: serial.Serial, address: int, size: int) -> None:
 def program(ser: serial.Serial, address: int, data: bytes) -> None:
     """
     Write one chunk to Flash.
-    Max CHUNK_SIZE bytes (4088) per call. Caller handles chunking.
+    Max CHUNK_SIZE bytes (4096) per call. Caller handles chunking.
     """
     payload = struct.pack('<II', address, len(data)) + data
     errcode, _ = send_and_recv(ser, OPCODE_PROGRAM, payload)
     _check_errcode(errcode, f"PROGRAM 0x{address:08X}")
+
+
+def program_stream(ser: serial.Serial, chunks, progress_cb=None) -> None:
+    """
+    Pipelined PROGRAM: keep one frame in flight.
+
+    Send the next chunk right after the previous one (without waiting for its
+    ACK), so UART TX overlaps the MCU's Flash programming. Requires the MCU
+    to receive via DMA: bytes arriving while Flash is busy are captured by
+    DMA hardware (CPU is stalled, interrupts cannot run).
+
+    chunks: iterable of (address, data) tuples.
+    progress_cb: optional callback(done_bytes), called after each ACK.
+    Raises ConnectionError on lost ACK, RuntimeError on non-OK errcode.
+    """
+    chunks = list(chunks)
+    if not chunks:
+        return
+
+    def _payload(addr, data):
+        return struct.pack('<II', addr, len(data)) + data
+
+    saved_timeout = ser.timeout
+    ser.timeout = 10.0
+    done = 0
+    try:
+        send_packet(ser, OPCODE_PROGRAM, _payload(chunks[0][0], chunks[0][1]))
+        prev = chunks[0]
+        for chunk in chunks[1:]:
+            send_packet(ser, OPCODE_PROGRAM, _payload(chunk[0], chunk[1]))
+            resp = recv_response(ser, debug_cb=_default_debug)
+            if resp is None:
+                raise ConnectionError("PROGRAM ACK lost at 0x%08X" % prev[0])
+            errcode, _ = resp
+            _check_errcode(errcode, "PROGRAM 0x%08X" % prev[0])
+            done += len(prev[1])
+            if progress_cb:
+                progress_cb(done)
+            prev = chunk
+        resp = recv_response(ser, debug_cb=_default_debug)
+        if resp is None:
+            raise ConnectionError("PROGRAM ACK lost at 0x%08X" % prev[0])
+        errcode, _ = resp
+        _check_errcode(errcode, "PROGRAM 0x%08X" % prev[0])
+        done += len(prev[1])
+        if progress_cb:
+            progress_cb(done)
+    finally:
+        ser.timeout = saved_timeout
 
 
 def verify(ser: serial.Serial, address: int, size: int, crc: int) -> None:
@@ -239,6 +288,8 @@ def flash_firmware(
       skip_verify: Skip verify step (debug only)
     """
 
+    _t0 = time.time()
+
     # ---- 1. Read and parse file ----
     if not os.path.exists(bin_path):
         raise FileNotFoundError(f"File not found: {bin_path}")
@@ -298,18 +349,7 @@ def flash_firmware(
         # Erase APP area
         print(f"Erasing APP region 0x{data_address:08X} +{data_length}...")
         erase(ser, data_address, data_length)
-        print("  APP erase: ACK, polling until done...")
-
-        for _poll in range(120):
-            time.sleep(0.5)
-            try:
-                _p = struct.pack("<B", INQUERY_SUBCODE_VERSION)
-                _e, _d = send_and_recv(ser, OPCODE_INQUERY, _p)
-                print(f"  Erase complete (poll {_poll + 1})")
-                break
-            except Exception:
-                if _poll % 4 == 0:
-                    print(f"    Still erasing... ({int((_poll + 1) * 0.5)}s)")
+        print("  APP erase: ACK (synchronous erase complete)")
 
     # ---- 4. PROGRAM Magic Header ----
     print(f"Programming magic header to 0x{MAGIC_HEADER_ADDRESS:08X} ({len(header_bytes)} B)...")
@@ -320,24 +360,21 @@ def flash_firmware(
         hdr_offset += len(chunk)
     print("  Header: OK")
 
-    # ---- 5. PROGRAM Firmware (chunked) ----
-    print(f"Programming firmware ({actual_chunk} B/chunk)...")
+    # ---- 5. PROGRAM Firmware (chunked, pipelined) ----
+    print(f"Programming firmware ({actual_chunk} B/chunk, pipelined)...")
     total = data_length
-    offset = 0
-
-    while offset < total:
-        chunk = firmware[offset:offset + actual_chunk]
-        addr = data_address + offset
-
-        try:
-            program(ser, addr, chunk)
-        except Exception as e:
-            print(f"\n  PROGRAM failed at 0x{addr:08X}: {e}")
-            raise
-
-        offset += len(chunk)
-        _progress_bar(offset, total, prefix="  ")
-
+    chunks = [
+        (data_address + off, firmware[off:off + actual_chunk])
+        for off in range(0, total, actual_chunk)
+    ]
+    try:
+        program_stream(
+            ser, chunks,
+            progress_cb=lambda done: _progress_bar(done, total, prefix="  "),
+        )
+    except Exception as e:
+        print(f"\n  PROGRAM failed: {e}")
+        raise
     print()  # newline
 
     # ---- 6. VERIFY ----
@@ -352,4 +389,4 @@ def flash_firmware(
     print("Booting application...")
     boot(ser)
     print("BOOT: OK")
-    print("\n=== Firmware upgrade completed successfully! ===")
+    print("\n=== Firmware upgrade completed successfully! (elapsed %.2f s) ===" % (time.time() - _t0))

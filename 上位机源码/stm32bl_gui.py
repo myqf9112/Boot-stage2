@@ -15,7 +15,7 @@ from flasher import (
     APP_BASE_ADDRESS, APP_MAX_SIZE,
     MAGIC_HEADER_ADDRESS, MAGIC_HEADER_SIZE,
     parse_xbin, generate_magic_header,
-    _align4,
+    _align4, program_stream,
 )
 MSG_LOG, MSG_PROGRESS, MSG_DONE = "LOG", "PROGRESS", "DONE"
 
@@ -39,6 +39,7 @@ class FlashWorker(threading.Thread):
             self._log("Open %s @ %d..." % (self.port, self.baud))
             ser = open_serial(self.port, self.baud)
             self._log("Connected: %s" % self.port)
+            t0 = time.time()
 
             # ---- Read and parse file ----
             if not os.path.exists(self.bin_path):
@@ -110,18 +111,7 @@ class FlashWorker(threading.Thread):
                 payload = struct.pack('<II', data_address, data_length)
                 errcode, _ = send_and_recv(ser, OPCODE_ERASE, payload)
                 self._check_errcode(errcode, "ERASE APP")
-                self._log("  APP erase: ACK, polling...")
-                for _poll in range(120):
-                    time.sleep(0.5)
-                    try:
-                        _p = struct.pack("<B", INQUERY_SUBCODE_VERSION)
-                        _e, _d = send_and_recv(ser, OPCODE_INQUERY, _p)
-                        self._check_errcode(_e, "POLL")
-                        self._log("  Erase done (poll %d)" % (_poll + 1))
-                        break
-                    except Exception:
-                        if _poll % 4 == 0:
-                            self._log("  Still erasing... (%ds)" % int((_poll + 1) * 0.5))
+                self._log("  APP erase: OK (synchronous erase complete)")
 
             # ---- PROGRAM Magic Header ----
             self._log("Programming magic header to 0x%08X (%d B)..." % (MAGIC_HEADER_ADDRESS, len(header_bytes)))
@@ -139,19 +129,20 @@ class FlashWorker(threading.Thread):
                 self.q.put((MSG_DONE, False, "Cancelled"))
                 return
 
-            # ---- PROGRAM Firmware ----
+            # ---- PROGRAM Firmware (pipelined) ----
             chunk_total = (data_length + actual_chunk - 1) // actual_chunk
-            self._log("Programming %d chunks (%d B each)..." % (chunk_total, actual_chunk))
-            offset = 0; chunk_idx = 0
-            while offset < data_length and not self._cancel:
-                chunk = firmware[offset:offset + actual_chunk]
-                addr = data_address + offset
-                self._log("  [%d/%d] 0x%08X +%d" % (chunk_idx + 1, chunk_total, addr, len(chunk)))
-                payload = struct.pack('<II', addr, len(chunk)) + chunk
-                errcode, _ = send_and_recv(ser, OPCODE_PROGRAM, payload)
-                self._check_errcode(errcode, "PROGRAM")
-                offset += len(chunk); chunk_idx += 1
-                self._progress(offset, data_length)
+            self._log("Programming %d chunks (%d B each, pipelined)..." % (chunk_total, actual_chunk))
+            chunks = [
+                (data_address + off, firmware[off:off + actual_chunk])
+                for off in range(0, data_length, actual_chunk)
+            ]
+
+            def _on_program_ack(done):
+                if self._cancel:
+                    raise RuntimeError("Cancelled by user")
+                self._progress(done, data_length)
+
+            program_stream(ser, chunks, progress_cb=_on_program_ack)
 
             if self._cancel:
                 self._log("CANCELLED")
@@ -173,7 +164,7 @@ class FlashWorker(threading.Thread):
             errcode, _ = send_and_recv(ser, OPCODE_BOOT, b'')
             self._check_errcode(errcode, "BOOT")
             self._log("BOOT: OK")
-            self._log("=== UPGRADE SUCCESS ===")
+            self._log("=== UPGRADE SUCCESS (%.2f s) ===" % (time.time() - t0))
             self.q.put((MSG_DONE, True, "Success"))
         except Exception as e:
             self._log("ERROR: " + str(e))

@@ -104,7 +104,7 @@ DEFAULT_TIMEOUT  = 30.0   # response timeout (s), large-area erase may take >10s
 
 RETRY_COUNT      = 3
 
-CHUNK_SIZE       = 4088  # MTU 4096 - 8 bytes (addr + size header)
+CHUNK_SIZE       = 4096  # max data/chunk: MTU(4104) - 8B addr+size header
 
 
 

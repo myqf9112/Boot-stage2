@@ -1,6 +1,7 @@
 
 #include "stm32f4xx_ll_tim.h"
 #include "stm32f4xx_ll_usart.h"
+#include "stm32f4xx_ll_dma.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -65,6 +66,7 @@ typedef enum
     RESPONSE_ERRORCODE_FORMAT,
     RESPONSE_ERRORCODE_VERIFY,
     RESPONSE_ERRORCODE_PARAM,
+    RESPONSE_ERRORCODE_FLASH,
     RESPONSE_ERRORCODE_UNKNOWN = 0xff,
 } packet_errcode_t;
 
@@ -113,6 +115,9 @@ static void boot_application(void)
     LL_USART_Disable(USART1);
 
     LL_USART_Disable(USART3);
+
+    LL_USART_DisableDMAReq_RX(USART3);
+    LL_DMA_DisableStream(DMA1, LL_DMA_STREAM_1);
 
     NVIC_DisableIRQ(TIM6_DAC_IRQn);
     NVIC_DisableIRQ(USART1_IRQn);
@@ -203,9 +208,11 @@ static void bl_opcode_erase_handler(void)
     log_i("Erase request: address=0x%08X, size=%u", address, size);
 
     stm32_flash_unlock();
-    stm32_flash_erase(address, size);
+    bool erase_ok = stm32_flash_erase(address, size);
     stm32_flash_lock();
-    bl_response(PACKET_OPCODE_ERASE, RESPONSE_ERRORCODE_OK, NULL, 0);
+    bl_response(PACKET_OPCODE_ERASE,
+                erase_ok ? RESPONSE_ERRORCODE_OK : RESPONSE_ERRORCODE_FLASH,
+                NULL, 0);
 }
 static void bl_opcode_program_handler(void)
 {
@@ -237,9 +244,11 @@ static void bl_opcode_program_handler(void)
     }
     log_i("Program request: address=0x%08X, size=%u", address, size);
     stm32_flash_unlock();
-    stm32_flash_program(address, data, size);
+    bool program_ok = stm32_flash_program(address, data, size);
     stm32_flash_lock();
-    bl_response(PACKET_OPCODE_PROGRAM, RESPONSE_ERRORCODE_OK, NULL, 0);
+    bl_response(PACKET_OPCODE_PROGRAM,
+                program_ok ? RESPONSE_ERRORCODE_OK : RESPONSE_ERRORCODE_FLASH,
+                NULL, 0);
 }
 
 static void bl_opcode_verify_handler(void)
@@ -265,7 +274,7 @@ static void bl_opcode_verify_handler(void)
         bl_response(PACKET_OPCODE_VERIFY, RESPONSE_ERRORCODE_PARAM, NULL, 0);
         return;
     }
-    log_w("Verify request: address=0x%08X, size=%u, crc32=%08X", address, size, crc);
+    log_d("Verify request: address=0x%08X, size=%u, crc32=%08X", address, size, crc);
     uint32_t ccrc = crc32((const uint8_t *)address, size);
     if (ccrc != crc)
     {
@@ -284,30 +293,30 @@ static void bl_packet_handler(void)
     {
     case PACKET_OPCODE_INQUERY:
         bl_opcode_inquery_handler();
-        log_e("Inquery received");
+        log_d("Inquery received");
         break;
 
     case PACKET_OPCODE_ERASE:
         bl_opcode_erase_handler();
-        log_e("Erase received");
+        log_d("Erase received");
         break;
 
     case PACKET_OPCODE_PROGRAM:
         bl_opcode_program_handler();
-        log_e("Program received");
+        log_d("Program received");
         break;
 
     case PACKET_OPCODE_VERIFY:
         bl_opcode_verify_handler();
-        log_e("Verify received");
+        log_d("Verify received");
         break;
     case PACKET_OPCODE_BOOT:
         bl_opcode_boot_handler();
-        log_e("Boot received");
+        log_d("Boot received");
         break;
     case PACKET_OPCODE_RESET:
         bl_opcode_reset_handler();
-        log_e("Reset received");
+        log_d("Reset received");
         break;
 
     default:
@@ -338,7 +347,7 @@ static bool bl_byte_handler(uint8_t byte)
     case PACKET_STATE_HEADER:
         if (packet_buffer[0] == 0xAA)
         {
-            log_i("Header OK");
+            log_d("Header OK");
             packet_state = PACKET_STATE_OPCODE;
         }
         else
@@ -355,7 +364,7 @@ static bool bl_byte_handler(uint8_t byte)
             packet_buffer[1] == PACKET_OPCODE_BOOT ||
             packet_buffer[1] == PACKET_OPCODE_RESET)
         {
-            log_w("Opcode OK:%02X", packet_buffer[1]);
+            log_d("Opcode OK:%02X", packet_buffer[1]);
             packet_opcode = (packet_opcode_t)packet_buffer[1];
             packet_state = PACKET_STATE_LENGTH;
         }
@@ -370,9 +379,9 @@ static bool bl_byte_handler(uint8_t byte)
         {
             // uint16_t payload_length = (packet_buffer[3] << 8) | packet_buffer[2];
             uint16_t payload_length = get_u16(&packet_buffer[2]);
-            if (payload_length <= PACKET_SIZE_MAX)
+            if (payload_length <= PAYLOAD_SIZE_MAX)
             {
-                log_i("Length OK:%u", payload_length);
+                log_d("Length OK:%u", payload_length);
                 packet_payload_length = payload_length;
                 if (payload_length > 0)
                 {
@@ -394,7 +403,7 @@ static bool bl_byte_handler(uint8_t byte)
         if (packet_index == 4 + packet_payload_length)
         {
 
-            log_i("Payload Received OK");
+            log_d("Payload Received OK");
             packet_state = PACKET_STATE_CRC16;
         }
         break;
@@ -409,7 +418,7 @@ static bool bl_byte_handler(uint8_t byte)
             {
                 full_packet = true;
                 log_d("crc16 ok:%04X", ccrc);
-                log_w("Packet complete: opcode=0x%2X, length=%u", packet_opcode, packet_payload_length);
+                log_d("Packet complete: opcode=0x%2X, length=%u", packet_opcode, packet_payload_length);
                 if (LOG_LVL >= ELOG_LVL_VERBOSE)
                     elog_hexdump("payload", 16, packet_buffer, 6 + packet_payload_length);
             }
@@ -435,9 +444,9 @@ static void bl_usart_rx_handler(const uint8_t *data, uint32_t length)
 
 static bool key_trap_check(void)
 {
-    for (uint32_t t = 0; t < BOOT_DELAY; t += 10)
+    for (uint32_t t = 0; t < BOOT_DELAY; t += 1)
     {
-        tim_delay_ms(10);
+        tim_delay_ms(1);
         if (!key_read(key1))
             return false;
     }
@@ -483,12 +492,13 @@ bool magic_header_trap_boot(void)
 
 bool rx_trap_boot(void)
 {
-    for (uint32_t i = 0; i < BOOT_DELAY; i += 10)
+    for (uint32_t i = 0; i < BOOT_DELAY; i += 1)
     {
-        tim_delay_ms(10);
+        tim_delay_ms(1);
+        bl_usart_flush_rx();
         if (!rb_empty(rxrb))
         {
-            log_w("data received, trap into boot");
+            log_d("data received, trap into boot");
             return true;
         }
     }
@@ -518,6 +528,10 @@ void bootloader_main(void)
     led_init(led1);
     led_on(led1);
     wait_key_release();
+
+    /* 进入烧录服务循环后,日志级别降为 WARN,避免阻塞帧应答 */
+    elog_set_filter_lvl(ELOG_LVL_WARN);
+
     while (1)
     {
 
@@ -527,6 +541,7 @@ void bootloader_main(void)
             tim_delay_ms(2);
             NVIC_SystemReset();
         }
+        bl_usart_flush_rx();
         if (!rb_empty(rxrb))
         {
             uint8_t byte;

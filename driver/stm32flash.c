@@ -1,6 +1,8 @@
 #include "stm32flash.h"
 #include "stdint.h"
+#include "stdbool.h"
 #include "stdio.h"
+#include "string.h"
 
 #define LOG_TAG "flash"
 #define LOG_LVL ELOG_LVL_INFO
@@ -38,8 +40,9 @@ void stm32_flash_lock(void)
     HAL_FLASH_Lock();
 }
 
-void stm32_flash_erase(uint32_t address, uint32_t size)
+bool stm32_flash_erase(uint32_t address, uint32_t size)
 {
+    bool ok = true;
     uint32_t addr = FLASH_BASE_ADDR;
     for (uint32_t i = 0; i < sizeof(sector_desc) / sizeof(sector_desc_t); i++)
     {
@@ -55,19 +58,27 @@ void stm32_flash_erase(uint32_t address, uint32_t size)
             if (HAL_FLASHEx_Erase(&eraseInit, &sectorError) != HAL_OK)
             {
                 log_e("flash erase error at sector %lu", i);
+                ok = false;
             }
         }
         addr += sector_desc[i].size;
     }
+    return ok;
 }
-void stm32_flash_program(uint32_t address, const uint8_t *data, uint32_t size)
+bool stm32_flash_program(uint32_t address, const uint8_t *data, uint32_t size)
 {
+    /* 注意:F405/407 不支持 64 位并行编程(x64 仅 F427/429/437/439),
+     * 双字写入会报 PGPERR,这里只能用单字(32位)编程 */
+    bool ok = true;
     for (uint32_t i = 0; i < size; i += 4)
     {
-        uint32_t word = *(uint32_t *)(data + i);
+        uint32_t word;
+        memcpy(&word, data + i, 4);
         if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, address + i, word) != HAL_OK)
         {
             log_w("failed to program word at address 0x%08lx", address + i);
+            ok = false;
         }
     }
+    return ok;
 }
