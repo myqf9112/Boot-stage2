@@ -98,7 +98,7 @@ static void usart_lowlevel_init(void)
     LL_USART_InitTypeDef USART_InitStruct;
     LL_USART_StructInit(&USART_InitStruct);
 
-    USART_InitStruct.BaudRate = 115200;
+    USART_InitStruct.BaudRate = 2000000u;
     USART_InitStruct.DataWidth = LL_USART_DATAWIDTH_8B;
     USART_InitStruct.StopBits = LL_USART_STOPBITS_1;
     USART_InitStruct.Parity = LL_USART_PARITY_NONE;
@@ -147,6 +147,12 @@ void bl_usart_register_rx_callback(bl_usart_rx_callback_t callback)
 
 void USART3_IRQHandler(void)
 {
+    /* 先处理溢出错误：ORE 会标记数据丢失，必须清除 */
+    if (LL_USART_IsActiveFlag_ORE(USART3))
+    {
+        LL_USART_ClearFlag_ORE(USART3);
+    }
+
     if (LL_USART_IsActiveFlag_RXNE(USART3))
     {
         if (rx_callback)

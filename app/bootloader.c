@@ -23,14 +23,14 @@
 #include "elog.h"
 
 #define PACKET_SIZE_MAX (4 + PAYLOAD_SIZE_MAX + 2) // header(1) + opcode(1) + length(2) + payload + crc16(2)
-#define RX_BUFFER_SIZE (5 * 1024)
+#define RX_BUFFER_SIZE (8 * 1024)
 #define RX_TIMEOUT_MS 20
 #define BL_VERSION "0.9.9"
 #define PAYLOAD_SIZE_MAX (4096 + 8) // 4096 program data + 8 bytes for address and size
 #define APP_BASE_ADDRESS 0x08010000
 #define BL_ADDRESS 0x08000000
 #define BL_SIZE (48 * 1024) // 48KB bootloader size
-#define BOOT_DELAY 3000     // 3S boot delay
+#define BOOT_DELAY 10000    // 10S boot delay (上位机连接窗口)
 typedef enum
 {
     PACKET_STATE_HEADER,
