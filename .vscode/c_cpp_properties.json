@@ -19,7 +19,7 @@
                 "STM32F407xx ",
                 "HSE_VALUE=8000000U"
             ],
-            "compilerPath": "tools/gcc-arm-none-eabi/10.3/bin/arm-none-eabi-gcc",
+            "compilerPath": "${workspaceFolder}/tools/gcc-arm-none-eabi/10.3/bin/arm-none-eabi-gcc",
             "intelliSenseMode": "linux-gcc-arm",
             "cStandard": "c11",
             "cppStandard": "gnu++11",

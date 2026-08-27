@@ -103,6 +103,8 @@ Examples:
                         help="Skip erase step")
     parser.add_argument("--skip-verify", action="store_true",
                         help="Skip verify step")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from .resume.json checkpoint if available")
     parser.add_argument("--list", action="store_true",
                         help="List available serial ports")
 
@@ -137,6 +139,7 @@ Examples:
                 base_addr=args.addr,
                 skip_erase=args.skip_erase,
                 skip_verify=args.skip_verify,
+                resume=args.resume,
             )
         elif args.action == "inquery":
             cmd_inquery(ser)

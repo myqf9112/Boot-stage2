@@ -16,16 +16,18 @@ from flasher import (
     MAGIC_HEADER_ADDRESS, MAGIC_HEADER_SIZE,
     parse_xbin, generate_magic_header,
     _align4, program_stream,
+    _save_checkpoint, _load_checkpoint, _clear_checkpoint,
 )
 MSG_LOG, MSG_PROGRESS, MSG_DONE = "LOG", "PROGRESS", "DONE"
 
 
 class FlashWorker(threading.Thread):
-    def __init__(self, q, port, baud, bin_path, base_addr, skip_erase, skip_verify):
+    def __init__(self, q, port, baud, bin_path, base_addr, skip_erase, skip_verify, resume=False):
         super().__init__(daemon=True)
         self.q = q; self.port = port; self.baud = baud
         self.bin_path = bin_path; self.base_addr = base_addr
         self.skip_erase = skip_erase; self.skip_verify = skip_verify
+        self.resume = resume
         self._cancel = False
     def cancel(self): self._cancel = True
     def _log(self, text): self.q.put((MSG_LOG, text))
@@ -85,6 +87,16 @@ class FlashWorker(threading.Thread):
             fw_crc32 = crc32(firmware)
             self._log("  Firmware size: %d B (%.1f KB)" % (data_length, data_length / 1024))
 
+            resume_stage = None
+            resume_offset = 0
+            if self.resume:
+                _cp = _load_checkpoint(self.bin_path, firmware, data_address, data_length)
+                if _cp:
+                    resume_stage, resume_offset = _cp
+                    self._log("Resume checkpoint: stage=%s offset=%d" % (resume_stage, resume_offset))
+                else:
+                    self._log("No valid checkpoint, starting from scratch")
+
             # ---- Query MTU ----
             try:
                 payload = struct.pack('<B', INQUERY_SUBCODE_MTU)
@@ -100,6 +112,8 @@ class FlashWorker(threading.Thread):
             # ---- ERASE ----
             if self.skip_erase:
                 self._log("ERASE: SKIPPED")
+            elif resume_stage is not None:
+                self._log("ERASE: SKIPPED (resuming, flash already erased)")
             else:
                 self._log("Erasing magic header 0x%08X +%d..." % (MAGIC_HEADER_ADDRESS, MAGIC_HEADER_SIZE))
                 payload = struct.pack('<II', MAGIC_HEADER_ADDRESS, MAGIC_HEADER_SIZE)
@@ -112,17 +126,22 @@ class FlashWorker(threading.Thread):
                 errcode, _ = send_and_recv(ser, OPCODE_ERASE, payload)
                 self._check_errcode(errcode, "ERASE APP")
                 self._log("  APP erase: OK (synchronous erase complete)")
+                _save_checkpoint(self.bin_path, "erased", 0, data_address, data_length, firmware)
 
             # ---- PROGRAM Magic Header ----
-            self._log("Programming magic header to 0x%08X (%d B)..." % (MAGIC_HEADER_ADDRESS, len(header_bytes)))
-            hdr_offset = 0
-            while hdr_offset < len(header_bytes) and not self._cancel:
-                chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
-                payload = struct.pack('<II', MAGIC_HEADER_ADDRESS + hdr_offset, len(chunk)) + chunk
-                errcode, _ = send_and_recv(ser, OPCODE_PROGRAM, payload)
-                self._check_errcode(errcode, "PROGRAM HEADER")
-                hdr_offset += len(chunk)
-            self._log("  Header: OK")
+            if resume_stage in ("header_done", "firmware"):
+                self._log("Header: SKIPPED (resuming, already programmed)")
+            else:
+                self._log("Programming magic header to 0x%08X (%d B)..." % (MAGIC_HEADER_ADDRESS, len(header_bytes)))
+                hdr_offset = 0
+                while hdr_offset < len(header_bytes) and not self._cancel:
+                    chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
+                    payload = struct.pack('<II', MAGIC_HEADER_ADDRESS + hdr_offset, len(chunk)) + chunk
+                    errcode, _ = send_and_recv(ser, OPCODE_PROGRAM, payload)
+                    self._check_errcode(errcode, "PROGRAM HEADER")
+                    hdr_offset += len(chunk)
+                self._log("  Header: OK")
+                _save_checkpoint(self.bin_path, "header_done", 0, data_address, data_length, firmware)
 
             if self._cancel:
                 self._log("CANCELLED")
@@ -130,17 +149,24 @@ class FlashWorker(threading.Thread):
                 return
 
             # ---- PROGRAM Firmware (pipelined) ----
-            chunk_total = (data_length + actual_chunk - 1) // actual_chunk
+            start_offset = resume_offset if resume_stage == "firmware" else 0
+            if start_offset:
+                self._log("Resuming firmware from offset %d / %d" % (start_offset, data_length))
+            remain = data_length - start_offset
+            chunk_total = (remain + actual_chunk - 1) // actual_chunk
             self._log("Programming %d chunks (%d B each, pipelined)..." % (chunk_total, actual_chunk))
             chunks = [
                 (data_address + off, firmware[off:off + actual_chunk])
-                for off in range(0, data_length, actual_chunk)
+                for off in range(start_offset, data_length, actual_chunk)
             ]
 
             def _on_program_ack(done):
                 if self._cancel:
                     raise RuntimeError("Cancelled by user")
-                self._progress(done, data_length)
+                _now = start_offset + done
+                self._progress(_now, data_length)
+                _save_checkpoint(self.bin_path, "firmware", _now,
+                                 data_address, data_length, firmware)
 
             program_stream(ser, chunks, progress_cb=_on_program_ack)
 
@@ -164,6 +190,7 @@ class FlashWorker(threading.Thread):
             errcode, _ = send_and_recv(ser, OPCODE_BOOT, b'')
             self._check_errcode(errcode, "BOOT")
             self._log("BOOT: OK")
+            _clear_checkpoint(self.bin_path)
             self._log("=== UPGRADE SUCCESS (%.2f s) ===" % (time.time() - t0))
             self.q.put((MSG_DONE, True, "Success"))
         except Exception as e:
@@ -347,6 +374,8 @@ class BootloaderGUI:
         ttk.Entry(r2, textvariable=self.addr_var, width=14, font=('Consolas', 9)).pack(side=tk.LEFT, padx=6)
         self.skip_erase_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(r2, text='跳过擦除', variable=self.skip_erase_var).pack(side=tk.LEFT, padx=10)
+        self.resume_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r2, text='断点续传', variable=self.resume_var).pack(side=tk.LEFT, padx=10)
         self.skip_verify_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(r2, text='跳过校验', variable=self.skip_verify_var).pack(side=tk.LEFT, padx=10)
         self.flash_btn = tk.Button(
@@ -467,7 +496,7 @@ class BootloaderGUI:
         self.log_text.configure(state=tk.NORMAL); self.log_text.delete(1.0, tk.END); self.log_text.configure(state=tk.DISABLED)
         self._log('=' * 50)
         self._log('开始固件烧录...')
-        self.worker = FlashWorker(self.msg_queue, port, baud, path, addr, self.skip_erase_var.get(), self.skip_verify_var.get())
+        self.worker = FlashWorker(self.msg_queue, port, baud, path, addr, self.skip_erase_var.get(), self.skip_verify_var.get(), self.resume_var.get())
         self.worker.start()
 
     def _simple_cmd(self, cmd):

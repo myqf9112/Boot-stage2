@@ -6,6 +6,8 @@ import os
 import sys
 import struct
 import time
+import json
+import hashlib
 from typing import Optional, Tuple
 
 import serial
@@ -265,12 +267,65 @@ def _align4(data: bytes) -> bytes:
     return data
 
 
+def _checkpoint_path(bin_path: str) -> str:
+    """Checkpoint file path: firmware file + '.resume.json'"""
+    return bin_path + ".resume.json"
+
+
+def _save_checkpoint(bin_path, stage, offset, data_address, data_length, firmware):
+    """Persist flash progress. Must be called AFTER the corresponding ACK."""
+    cp = {
+        "firmware_sha256": hashlib.sha256(firmware).hexdigest(),
+        "stage": stage,               # "erased" | "header_done" | "firmware"
+        "offset": offset,             # firmware bytes ACKed (firmware stage)
+        "data_address": data_address,
+        "data_length": data_length,
+    }
+    try:
+        with open(_checkpoint_path(bin_path), "w", encoding="utf-8") as f:
+            json.dump(cp, f)
+    except OSError as e:
+        print(f"  (checkpoint save failed: {e})")
+
+
+def _load_checkpoint(bin_path, firmware, data_address, data_length):
+    """Return (stage, offset) or None if no valid checkpoint for this firmware."""
+    try:
+        with open(_checkpoint_path(bin_path), "r", encoding="utf-8") as f:
+            cp = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if cp.get("firmware_sha256") != hashlib.sha256(firmware).hexdigest():
+        return None
+    if cp.get("data_address") != data_address or cp.get("data_length") != data_length:
+        return None
+    stage = cp.get("stage")
+    if stage not in ("erased", "header_done", "firmware"):
+        return None
+    try:
+        offset = int(cp.get("offset", 0))
+    except (TypeError, ValueError):
+        return None
+    if stage == "firmware" and not (0 <= offset <= data_length):
+        return None
+    return stage, offset
+
+
+def _clear_checkpoint(bin_path):
+    """Remove checkpoint after a fully successful flash."""
+    try:
+        os.remove(_checkpoint_path(bin_path))
+    except OSError:
+        pass
+
+
 def flash_firmware(
     ser: serial.Serial,
     bin_path: str,
     base_addr: int = APP_BASE_ADDRESS,
     skip_erase: bool = False,
     skip_verify: bool = False,
+    resume: bool = False,
 ) -> None:
     """
     Complete firmware flash workflow:
@@ -286,6 +341,9 @@ def flash_firmware(
       base_addr:  Override APP base address (only for .bin, ignored for .xbin)
       skip_erase: Skip erase step (debug only)
       skip_verify: Skip verify step (debug only)
+      resume: Resume from <bin>.resume.json checkpoint if valid. Skips
+              already-finished stages; safe because re-programming the
+              same data is idempotent and ERASE is never repeated.
     """
 
     _t0 = time.time()
@@ -326,6 +384,17 @@ def flash_firmware(
     # Recalculate CRC32 on padded firmware
     fw_crc32 = crc32(firmware)
 
+    # ---- Resume checkpoint ----
+    resume_stage = None
+    resume_offset = 0
+    if resume:
+        _cp = _load_checkpoint(bin_path, firmware, data_address, data_length)
+        if _cp:
+            resume_stage, resume_offset = _cp
+            print(f"  Resume checkpoint: stage={resume_stage}, offset={resume_offset}")
+        else:
+            print("  No valid checkpoint, starting from scratch")
+
     # ---- 2. Query Bootloader ----
     try:
         version = inquery_version(ser)
@@ -340,6 +409,8 @@ def flash_firmware(
     # ---- 3. ERASE ----
     if skip_erase:
         print("ERASE: SKIPPED (--skip-erase)")
+    elif resume_stage is not None:
+        print("ERASE: SKIPPED (resuming, flash already erased)")
     else:
         # Erase magic header area
         print(f"Erasing magic header 0x{MAGIC_HEADER_ADDRESS:08X} +{MAGIC_HEADER_SIZE}...")
@@ -350,30 +421,47 @@ def flash_firmware(
         print(f"Erasing APP region 0x{data_address:08X} +{data_length}...")
         erase(ser, data_address, data_length)
         print("  APP erase: ACK (synchronous erase complete)")
+        # 擦除完成才落盘:之后续传绝不再擦除
+        _save_checkpoint(bin_path, "erased", 0, data_address, data_length, firmware)
 
     # ---- 4. PROGRAM Magic Header ----
-    print(f"Programming magic header to 0x{MAGIC_HEADER_ADDRESS:08X} ({len(header_bytes)} B)...")
-    hdr_offset = 0
-    while hdr_offset < len(header_bytes):
-        chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
-        program(ser, MAGIC_HEADER_ADDRESS + hdr_offset, chunk)
-        hdr_offset += len(chunk)
-    print("  Header: OK")
+    if resume_stage in ("header_done", "firmware"):
+        print("Header: SKIPPED (resuming, already programmed)")
+    else:
+        print(f"Programming magic header to 0x{MAGIC_HEADER_ADDRESS:08X} ({len(header_bytes)} B)...")
+        hdr_offset = 0
+        while hdr_offset < len(header_bytes):
+            chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
+            program(ser, MAGIC_HEADER_ADDRESS + hdr_offset, chunk)
+            hdr_offset += len(chunk)
+        print("  Header: OK")
+        _save_checkpoint(bin_path, "header_done", 0, data_address, data_length, firmware)
 
     # ---- 5. PROGRAM Firmware (chunked, pipelined) ----
+    start_offset = resume_offset if resume_stage == "firmware" else 0
+    if start_offset:
+        print(f"Resuming firmware from offset {start_offset} / {data_length}")
     print(f"Programming firmware ({actual_chunk} B/chunk, pipelined)...")
     total = data_length
     chunks = [
         (data_address + off, firmware[off:off + actual_chunk])
-        for off in range(0, total, actual_chunk)
+        for off in range(start_offset, total, actual_chunk)
     ]
+
+    saved_offset = start_offset
+
+    def _on_ack(done):
+        nonlocal saved_offset
+        saved_offset = start_offset + done
+        _progress_bar(saved_offset, total, prefix="  ")
+        _save_checkpoint(bin_path, "firmware", saved_offset,
+                         data_address, data_length, firmware)
+
     try:
-        program_stream(
-            ser, chunks,
-            progress_cb=lambda done: _progress_bar(done, total, prefix="  "),
-        )
+        program_stream(ser, chunks, progress_cb=_on_ack)
     except Exception as e:
         print(f"\n  PROGRAM failed: {e}")
+        print(f"  (progress saved at {saved_offset}, re-run with --resume to continue)")
         raise
     print()  # newline
 
@@ -389,4 +477,5 @@ def flash_firmware(
     print("Booting application...")
     boot(ser)
     print("BOOT: OK")
+    _clear_checkpoint(bin_path)
     print("\n=== Firmware upgrade completed successfully! (elapsed %.2f s) ===" % (time.time() - _t0))
