@@ -4,8 +4,6 @@
 #include "crc32.h"
 #include "utils.h"
 #define MAGIC_HEADER_MAGIC 0x4D414749   // "MAGI"的ASCII码
-#define MAGIC_HEADER_ADDRESS 0x0800C000 // 魔术头在内存中的地址
-
 typedef struct
 {
     uint32_t magic;         // 魔术，用于表示这是一个有效的魔术头
@@ -25,9 +23,13 @@ typedef struct
     uint32_t this_crc32;   // 魔术头的CRC32校验值，用于验证魔术头的完整性
 } magic_header_t;
 
-bool magic_header_validate(void)
+bool magic_header_validate(uint32_t magic_header_address)
 {
-    magic_header_t *header = (magic_header_t *)MAGIC_HEADER_ADDRESS;
+    magic_header_t *header = (magic_header_t *)magic_header_address;
+    if(header->this_address != magic_header_address)
+    {
+        return false; // 魔术头地址不匹配
+    }
     if (header->magic != MAGIC_HEADER_MAGIC)
     {
         return false; // 魔术头不合法
@@ -41,32 +43,32 @@ bool magic_header_validate(void)
     return true; // 魔术头合法
 }
 
-magic_header_type_t magic_header_get_type(void)
+magic_header_type_t magic_header_get_type(uint32_t magic_header_address)
 {
-    magic_header_t *header = (magic_header_t *)MAGIC_HEADER_ADDRESS;
+    magic_header_t *header = (magic_header_t *)magic_header_address;
     return (magic_header_type_t)header->data_type; // 返回魔术头的类型
 }
-uint32_t magic_header_get_offset(void)
+uint32_t magic_header_get_offset(uint32_t magic_header_address)
 {
-    magic_header_t *header = (magic_header_t *)MAGIC_HEADER_ADDRESS;
+    magic_header_t *header = (magic_header_t *)magic_header_address;
     return header->data_offset; // 返回魔术头的偏移地址
 }
 
-uint32_t magic_header_get_address(void)
+uint32_t magic_header_get_address(uint32_t magic_header_address)
 {
-    magic_header_t *header = (magic_header_t *)MAGIC_HEADER_ADDRESS;
+    magic_header_t *header = (magic_header_t *)magic_header_address;
     return header->data_address; // 返回魔术头的地址
 }
 
-uint32_t magic_header_get_length(void)
+uint32_t magic_header_get_length(uint32_t magic_header_address)
 {
 
-    magic_header_t *header = (magic_header_t *)MAGIC_HEADER_ADDRESS;
+    magic_header_t *header = (magic_header_t *)magic_header_address;
     return header->data_length; // 返回魔术头的长度
 }
 
-uint32_t magic_header_get_crc32(void)
+uint32_t magic_header_get_crc32(uint32_t magic_header_address)
 {
-    magic_header_t *header = (magic_header_t *)MAGIC_HEADER_ADDRESS;
+    magic_header_t *header = (magic_header_t *)magic_header_address;
     return header->data_crc32; // 返回魔术头的CRC32校验值
 }

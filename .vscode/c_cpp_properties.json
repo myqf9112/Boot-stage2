@@ -3,15 +3,16 @@
         {
             "name": "Boot",
             "includePath": [
-                "app/",
-                "components/crc/",
-                "components/easylogger/",
-                "components/ringbuffer/",
-                "driver/",
-                "platform/board/",
-                "platform/cmsis/device/",
-                "platform/driver/Src/",
-                "platform/syscall"
+                "${workspaceFolder}/app/",
+                "${workspaceFolder}/components/crc/",
+                "${workspaceFolder}/components/easylogger/",
+                "${workspaceFolder}/components/ringbuffer/",
+                "${workspaceFolder}/driver/",
+                "${workspaceFolder}/platform/board/",
+                "${workspaceFolder}/platform/cmsis/device/",
+                "${workspaceFolder}/platform/driver/Src/",
+                "${workspaceFolder}/platform/driver/Inc/",
+                "${workspaceFolder}/platform/syscall"
             ],
             "defines": [
                 "USE_HAL_DRIVER ",

@@ -67,8 +67,7 @@ bool stm32_flash_erase(uint32_t address, uint32_t size)
 }
 bool stm32_flash_program(uint32_t address, const uint8_t *data, uint32_t size)
 {
-    /* 注意:F405/407 不支持 64 位并行编程(x64 仅 F427/429/437/439),
-     * 双字写入会报 PGPERR,这里只能用单字(32位)编程 */
+
     bool ok = true;
     for (uint32_t i = 0; i < size; i += 4)
     {

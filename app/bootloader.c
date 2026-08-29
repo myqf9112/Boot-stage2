@@ -1,4 +1,3 @@
-
 #include "stm32f4xx_ll_tim.h"
 #include "stm32f4xx_ll_usart.h"
 #include "stm32f4xx_ll_dma.h"
@@ -19,6 +18,7 @@
 #include "led_desc.h"
 #include "magic_header.h"
 #include "utils.h"
+#include "boot_state.h"
 #define LOG_TAG "boot"
 #define LOG_LVL ELOG_LVL_INFO
 #include "elog.h"
@@ -28,11 +28,24 @@
 #define RX_TIMEOUT_MS 20
 #define BL_VERSION "0.9.9"
 #define PAYLOAD_SIZE_MAX (4096 + 8) // 4096 program data + 8 bytes for address and size
+#define BOOT_DELAY 3000             //  boot delay (上位机连接窗口)
+#define KEY_HOLD_TRAP_MS 1500       // 按键进入 bootloader 需连续按住的时间(ms)
+
+/*
+Bootloader : 0x08000000  32KB  (sector 0~1)
+Boot State : 0x08008000  16KB  (sector 2)
+A Header   : 0x0800C000  16KB  (sector 3)
+A App      : 0x08010000  448KB (sector 4~7)
+B Header   : 0x08080000  4KB   (sector 8 起始)
+B App      : 0x08081000  508KB (sector 8 尾~11)
+*/
 #define APP_BASE_ADDRESS 0x08010000
 #define BL_ADDRESS 0x08000000
-#define BL_SIZE (48 * 1024) // 48KB bootloader size
-#define BOOT_DELAY 3000    //  boot delay (上位机连接窗口)
-#define KEY_HOLD_TRAP_MS 1500 // 按键进入 bootloader 需连续按住的时间(ms)
+#define BL_SIZE (32 * 1024)              // 32KB bootloader size
+#define A_MAGICHEADER_ADDRESS 0x0800C000 // A槽magic header存储地址
+#define B_MAGICHEADER_ADDRESS 0x08080000 // B槽magic header存储地址
+#define B_APP_ADDRESS 0x08081000         // B槽应用程序存储地址
+
 typedef enum
 {
     PACKET_STATE_HEADER,
@@ -78,34 +91,55 @@ static uint32_t packet_index;
 static packet_opcode_t packet_opcode;
 static uint16_t packet_payload_length;
 static packet_state_machine_t packet_state = PACKET_STATE_HEADER;
-static bool application_validate(void)
+
+static uint32_t slot_header_address(boot_slot_t slot)
 {
-    if (!magic_header_validate())
+    switch (slot)
     {
-        log_e("Magic header invalid");
+    case BOOT_SLOT_A:
+        return A_MAGICHEADER_ADDRESS;
+    case BOOT_SLOT_B:
+        return B_MAGICHEADER_ADDRESS;
+    default:
+        return 0;
+    }
+}
+
+static bool slot_validate(boot_slot_t slot)
+{
+    uint32_t header_address = slot_header_address(slot);
+    if (header_address == 0) {
+        log_e("Invalid slot %d", slot);
         return false;
     }
 
-    uint32_t addr = magic_header_get_address();
-    uint32_t size = magic_header_get_length();
-    uint32_t crc = magic_header_get_crc32();
-    uint32_t ccrc = crc32((const uint8_t *)addr, size);
-    if (crc != ccrc)
-    {
-        log_w("Application CRC32 mismatch: expected %08X, got %08X", crc, ccrc);
+    if (!magic_header_validate(header_address)) {
+        log_w("Slot %d magic header invalid", slot);
         return false;
     }
 
-    log_i("Application validated OK");
+    // 获取固件地址、大小和存储的 CRC
+    uint32_t addr = magic_header_get_address(header_address);
+    uint32_t size = magic_header_get_length(header_address);
+    uint32_t stored_crc = magic_header_get_crc32(header_address);
+    uint32_t calc_crc = crc32((const uint8_t *)addr, size);
+
+    if (stored_crc != calc_crc) {
+        log_w("Slot %d CRC32 mismatch: expected 0x%08X, got 0x%08X", slot, stored_crc, calc_crc);
+        return false;
+    }
+
+    log_i("Slot %d validated OK", slot);
     return true;
 }
-static void boot_application(void)
+
+static void boot_slot(boot_slot_t slot)
 {
-    if (!application_validate())
-    {
-        log_e("Application validate failed,catnot boot");
+    uint32_t header_address = slot_header_address(slot);
+    if (header_address == 0)
         return;
-    }
+    uint32_t app_address = magic_header_get_address(header_address);
+    log_i("Booting slot %d, header at 0x%08X, app at 0x%08X", slot, header_address, app_address);
     log_i("Booting  application...");
     tim_delay_ms(2);
     led_off(led1);
@@ -123,6 +157,39 @@ static void boot_application(void)
     NVIC_DisableIRQ(TIM6_DAC_IRQn);
     NVIC_DisableIRQ(USART1_IRQn);
     NVIC_DisableIRQ(USART3_IRQn);
+    SCB->VTOR = app_address;
+    extern void JumpApp(uint32_t base);
+    JumpApp(app_address);
+}
+static bool application_validate(void)
+{
+    if (!magic_header_validate(A_MAGICHEADER_ADDRESS))
+    {
+        log_e("Magic header invalid");
+        return false;
+    }
+
+    uint32_t addr = magic_header_get_address(A_MAGICHEADER_ADDRESS);
+    uint32_t size = magic_header_get_length(A_MAGICHEADER_ADDRESS);
+    uint32_t crc = magic_header_get_crc32(A_MAGICHEADER_ADDRESS);
+    uint32_t ccrc = crc32((const uint8_t *)addr, size);
+    if (crc != ccrc)
+    {
+        log_w("Application CRC32 mismatch: expected %08X, got %08X", crc, ccrc);
+        return false;
+    }
+
+    log_i("Application validated OK");
+    return true;
+}
+static void boot_application(void)
+{
+    if (!application_validate())
+    {
+        log_e("Application validate failed,catnot boot");
+        return;
+    }
+
     SCB->VTOR = APP_BASE_ADDRESS;
     extern void JumpApp(uint32_t base);
     JumpApp(APP_BASE_ADDRESS);
@@ -489,7 +556,7 @@ static bool key_press_check(void)
 bool magic_header_trap_boot(void)
 {
 
-    if (!magic_header_validate())
+    if (!magic_header_validate(A_MAGICHEADER_ADDRESS))
     {
         log_e("Magic header invalid, skip trap");
         return true;
@@ -522,6 +589,10 @@ bool rx_trap_boot(void)
 
 void bootloader_main(void)
 {
+
+    boot_state_t st = boot_state_read();
+    log_i("boot_magic=%u active=%u pending=%u attempts=%u",
+          st.magic, st.active_slot, st.pending_slot, st.boot_attempts);
     log_i("Bootloader started.\r");
     key_init(key1);
     rxrb = rb_new(rb_buffer, RX_BUFFER_SIZE);
@@ -530,14 +601,25 @@ void bootloader_main(void)
 
     bool trapboot = false;
 
- if (!trapboot)
+    if (!trapboot)
         trapboot = key_trap_check();
 
     if (!trapboot)
         trapboot = rx_trap_boot();
 
-    if (!trapboot)
-        boot_application();
+   //if (!trapboot)
+   //    boot_application();
+
+  if (!trapboot) {
+        if (slot_validate(BOOT_SLOT_A)) {
+            boot_slot(BOOT_SLOT_A);   // 跳转，不返回
+        }
+        // A 无效则进入烧录模式（旧版本也是如此）
+        log_e("Slot A invalid, entering recovery mode");
+    } else {
+        log_i("Trap triggered, entering recovery mode");
+    }
+
 
     led_init(led1);
     led_on(led1);
