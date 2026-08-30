@@ -1,11 +1,13 @@
 # stm32bl.py - STM32F407 Bootloader Host CLI Tool
 #
 # Usage:
-#   python stm32bl.py COM3 flash firmware.xbin       # Flash .xbin (with magic header)
-#   python stm32bl.py COM3 flash firmware.bin         # Flash .bin (auto-generate header)
-#   python stm32bl.py COM3 flash firmware.bin --addr 0x08020000
-#   python stm32bl.py COM3 flash firmware.bin --skip-erase --skip-verify
+#   python stm32bl.py COM3 flash firmware.bin --slot A    # Flash to Slot A (auto header)
+#   python stm32bl.py COM3 flash firmware.bin --slot B    # Flash to Slot B
+#   python stm32bl.py COM3 flash firmware.xbin            # Flash .xbin (with magic header)
+#   python stm32bl.py COM3 flash firmware.bin --slot B --addr 0x08081000
 #   python stm32bl.py COM3 inquery                    # Query version/MTU
+#   python stm32bl.py COM3 status                     # Query A/B slot status
+#   python stm32bl.py COM3 switch --slot B            # Switch boot slot (pending)
 #   python stm32bl.py COM3 boot                       # Jump to APP only
 #   python stm32bl.py COM3 reset                      # System reset
 #   python stm32bl.py --list                          # List serial ports
@@ -29,8 +31,8 @@ from protocol import (
     send_and_recv, ERROR_NAMES,
 )
 from flasher import (
-    flash_firmware, inquery_version, inquery_mtu,
-    boot, reset, APP_BASE_ADDRESS, MAGIC_HEADER_ADDRESS,
+    flash_firmware, inquery_version, inquery_mtu, inquery_slot_status,
+    boot, reset, switch_slot,
 )
 
 
@@ -60,6 +62,26 @@ def cmd_inquery(ser: serial.Serial) -> None:
         print(f"  MTU query failed: {e}")
 
 
+def cmd_status(ser: serial.Serial) -> None:
+    """Query A/B slot status"""
+    st = inquery_slot_status(ser)
+    slot_name = {0: 'A', 1: 'B', 0xFF: 'None'}
+    print(f"Active slot : {slot_name.get(st['active'], st['active'])}")
+    print(f"Pending slot: {slot_name.get(st['pending'], st['pending'])}")
+    print(f"Boot attempts: {st['boot_attempts']}")
+    a_ok = bool(st['valid_mask'] & 0x01)
+    b_ok = bool(st['valid_mask'] & 0x02)
+    print(f"Slot A valid: {'YES' if a_ok else 'NO'}")
+    print(f"Slot B valid: {'YES' if b_ok else 'NO'}")
+
+
+def cmd_switch(ser: serial.Serial, slot: str) -> None:
+    """Switch boot slot (write pending_slot, takes effect on next reset)"""
+    print(f"Sending SWITCH_SLOT to {slot.upper()}...")
+    target = switch_slot(ser, slot)
+    print(f"Done. pending_slot = {target} (0=A, 1=B). Reset the board to take effect.")
+
+
 def cmd_boot(ser: serial.Serial) -> None:
     """Send BOOT command"""
     print("Sending BOOT command...")
@@ -80,9 +102,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python stm32bl.py COM3 flash firmware.xbin
-  python stm32bl.py COM3 flash firmware.bin
-  python stm32bl.py COM3 flash firmware.bin --addr 0x08020000
+  python stm32bl.py COM3 flash firmware.bin --slot A
+  python stm32bl.py COM3 flash firmware.bin --slot B
+  python stm32bl.py COM3 status
+  python stm32bl.py COM3 switch --slot B
   python stm32bl.py COM3 boot
   python stm32bl.py --list
         """.strip(),
@@ -90,13 +113,15 @@ Examples:
 
     parser.add_argument("port", nargs="?", help="Serial port (e.g. COM3, /dev/ttyUSB0)")
     parser.add_argument("action", nargs="?", default="flash",
-                        choices=["flash", "inquery", "boot", "reset"],
+                        choices=["flash", "inquery", "boot", "reset", "switch", "status"],
                         help="Action to perform (default: flash)")
 
     parser.add_argument("file", nargs="?", help="Firmware file (.xbin or .bin, for flash)")
+    parser.add_argument("--slot", type=str, default='A', choices=['A', 'B'],
+                        help="Target slot for flash (default: A). Also used by 'switch'.")
     parser.add_argument("--addr", type=lambda x: int(x, 0),
-                        default=APP_BASE_ADDRESS,
-                        help=f"APP base address for .bin files (default: 0x{APP_BASE_ADDRESS:08X})")
+                        default=None,
+                        help="Override APP base address for .bin files (default: slot base)")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUDRATE,
                         help=f"Baud rate (default: {DEFAULT_BAUDRATE})")
     parser.add_argument("--skip-erase", action="store_true",
@@ -105,6 +130,8 @@ Examples:
                         help="Skip verify step")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from .resume.json checkpoint if available")
+    parser.add_argument("--no-switch", action="store_true",
+                        help="After flash, do NOT switch slot/reset (just send BOOT)")
     parser.add_argument("--list", action="store_true",
                         help="List available serial ports")
 
@@ -123,6 +150,10 @@ Examples:
     if args.action == "flash" and not args.file:
         parser.error("the following arguments are required for flash: file (.xbin or .bin)")
 
+    # switch requires --slot
+    if args.action == "switch" and args.slot not in ('A', 'B'):
+        parser.error("switch requires --slot A|B")
+
     # Open serial port
     try:
         ser = open_serial(args.port, args.baud)
@@ -136,10 +167,12 @@ Examples:
             flash_firmware(
                 ser,
                 bin_path=args.file,
+                slot=args.slot,
                 base_addr=args.addr,
                 skip_erase=args.skip_erase,
                 skip_verify=args.skip_verify,
                 resume=args.resume,
+                switch_after=not args.no_switch,
             )
         elif args.action == "inquery":
             cmd_inquery(ser)
@@ -147,6 +180,10 @@ Examples:
             cmd_boot(ser)
         elif args.action == "reset":
             cmd_reset(ser)
+        elif args.action == "switch":
+            cmd_switch(ser, args.slot)
+        elif args.action == "status":
+            cmd_status(ser)
     except Exception as e:
         print(f"\nERROR: {e}")
         sys.exit(1)

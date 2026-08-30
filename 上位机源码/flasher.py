@@ -14,22 +14,37 @@ import serial
 
 from protocol import (
     OPCODE_INQUERY, OPCODE_ERASE, OPCODE_PROGRAM, OPCODE_VERIFY,
-    OPCODE_BOOT, OPCODE_RESET,
-    INQUERY_SUBCODE_VERSION, INQUERY_SUBCODE_MTU,
-    ERR_OK, ERROR_NAMES,
+    OPCODE_BOOT, OPCODE_RESET, OPCODE_SWITCH_SLOT,
+    INQUERY_SUBCODE_VERSION, INQUERY_SUBCODE_MTU, INQUERY_SUBCODE_SLOT_STATUS,
+    ERR_OK, ERR_PARAM, ERROR_NAMES,
     CHUNK_SIZE,
     send_and_recv, send_packet, recv_response, _default_debug, crc32,
 )
 
-# STM32F407 Flash layout
+# STM32F407 Flash layout (1MB, A/B dual-slot)
 BL_ADDRESS         = 0x08000000
-BL_SIZE            = 48 * 1024      # 48KB bootloader
-MAGIC_HEADER_ADDRESS = 0x0800C000   # Magic header address in Flash
-MAGIC_HEADER_SIZE    = 4096         # Magic header size (padded)
-APP_BASE_ADDRESS     = 0x08010000   # APP region base address
-APP_MAX_SIZE         = 512 * 1024   # STM32F407VE total Flash 512KB
+BL_SIZE            = 32 * 1024      # bootloader (sectors 0-1)
+STATE_ADDRESS      = 0x08008000     # boot state (sector 2)
 
-MAGIC_HEADER_MAGIC = 0x4D414749     # "MAGI"
+# 槽位配置（必须与 bootloader.c 分区表一致）
+SLOTS = {
+    'A': {
+        'header_addr': 0x0800C000,   # A_Hdr (sector 3, 16KB)
+        'app_addr':    0x08010000,   # A_App (sectors 4-7, 448KB)
+        'app_size':    448 * 1024,
+    },
+    'B': {
+        'header_addr': 0x08080000,   # B_Hdr (sector 8 起始, 4KB)
+        'app_addr':    0x08081000,   # B_App (sector 8 尾 + 9-11, 508KB)
+        'app_size':    508 * 1024,
+    },
+}
+
+MAGIC_HEADER_ADDRESS = SLOTS['A']['header_addr']  # 兼容旧接口
+APP_BASE_ADDRESS     = SLOTS['A']['app_addr']
+APP_MAX_SIZE         = 512 * 1024                 # 兼容旧接口（历史值）
+MAGIC_HEADER_SIZE    = 256                        # magic_header_t 结构体大小
+MAGIC_HEADER_MAGIC   = 0x4D414749                 # "MAGI"
 
 
 def _check_errcode(errcode: int, op_name: str) -> None:
@@ -59,6 +74,42 @@ def inquery_mtu(ser: serial.Serial) -> int:
     _check_errcode(errcode, "INQUERY MTU")
     mtu = struct.unpack('<H', data)[0]
     return mtu
+
+
+def inquery_slot_status(ser: serial.Serial) -> dict:
+    """Query bootloader slot status: active/pending/boot_attempts/valid_mask"""
+    payload = struct.pack('<B', INQUERY_SUBCODE_SLOT_STATUS)
+    errcode, data = send_and_recv(ser, OPCODE_INQUERY, payload)
+    _check_errcode(errcode, "INQUERY SLOT STATUS")
+    if len(data) < 4:
+        raise RuntimeError(f"Slot status response too short: {len(data)} bytes")
+    return {
+        'active': data[0],        # 0=A, 1=B
+        'pending': data[1],       # 0xFF=无
+        'boot_attempts': data[2], # 连续看门狗复位次数
+        'valid_mask': data[3],    # bit0=A有效, bit1=B有效
+    }
+
+
+def switch_slot(ser: serial.Serial, slot: str) -> int:
+    """
+    请求切换启动槽（写 pending_slot，下次复位生效）。
+    返回目标槽编号 (0=A, 1=B)。
+    """
+    s = slot.upper()
+    if s not in SLOTS:
+        raise ValueError(f"Invalid slot: {slot} (must be A or B)")
+    target = 0 if s == 'A' else 1
+    payload = struct.pack('<B', target)
+    errcode, data = send_and_recv(ser, OPCODE_SWITCH_SLOT, payload)
+    if errcode == ERR_OK:
+        return target
+    if errcode == ERR_PARAM:
+        if data and data[0] == 2:
+            raise RuntimeError("SWITCH_SLOT: target slot firmware invalid (not programmed?)")
+        raise RuntimeError("SWITCH_SLOT: invalid slot parameter")
+    _check_errcode(errcode, "SWITCH_SLOT")
+    return target
 
 
 def erase(ser: serial.Serial, address: int, size: int) -> None:
@@ -202,31 +253,39 @@ def parse_xbin(data: bytes) -> Tuple[bytes, bytes, int, int, int]:
     return header_bytes, firmware_bytes, data_address, data_length, data_crc32
 
 
-def generate_magic_header(firmware: bytes) -> bytes:
+def generate_magic_header(firmware: bytes, slot: str = 'A', version: str = None) -> bytes:
     """
     Auto-generate a magic header for raw .bin firmware.
-    Uses default addresses: header at 0x0800C000, firmware at 0x08010000.
+    与 bootloader 的 magic_header_t (256B) 严格对应。
+    slot: 'A' 或 'B'，决定 header 地址与 APP 加载地址。
     """
-    header = bytearray(MAGIC_HEADER_SIZE)
+    s = slot.upper()
+    if s not in SLOTS:
+        raise ValueError(f"Invalid slot: {slot} (must be A or B)")
+    header_addr = SLOTS[s]['header_addr']
+    app_addr    = SLOTS[s]['app_addr']
+
+    header = bytearray(MAGIC_HEADER_SIZE)  # 256
 
     # magic
     struct.pack_into('<I', header, 0, MAGIC_HEADER_MAGIC)
-    # data_type = 1 (firmware)
-    struct.pack_into('<I', header, 32, 1)
-    # data_offset
-    struct.pack_into('<I', header, 36, MAGIC_HEADER_SIZE)
+    # data_type = 0 (MAGIC_HEADER_TYPE_APP)
+    struct.pack_into('<I', header, 32, 0)
+    # data_offset（bootloader 不校验此字段，置 0）
+    struct.pack_into('<I', header, 36, 0)
     # data_address
-    struct.pack_into('<I', header, 40, APP_BASE_ADDRESS)
+    struct.pack_into('<I', header, 40, app_addr)
     # data_length
     struct.pack_into('<I', header, 44, len(firmware))
     # data_crc32
     struct.pack_into('<I', header, 48, crc32(firmware))
     # version (128 bytes at offset 96)
-    ver = time.strftime("v1.0.0-%y%m%d-%H%M-auto", time.localtime())
-    ver_bytes = ver.encode('ascii').ljust(128, b'\x00')
+    if version is None:
+        version = time.strftime("v1.0.0-%y%m%d-%H%M-auto", time.localtime())
+    ver_bytes = version.encode('ascii', errors='replace').ljust(128, b'\x00')
     header[96:224] = ver_bytes[:128]
     # this_address
-    struct.pack_into('<I', header, 248, MAGIC_HEADER_ADDRESS)
+    struct.pack_into('<I', header, 248, header_addr)
     # this_crc32 (CRC of bytes 0..251)
     hdr_crc = crc32(bytes(header[:252]))
     struct.pack_into('<I', header, 252, hdr_crc)
@@ -322,31 +381,39 @@ def _clear_checkpoint(bin_path):
 def flash_firmware(
     ser: serial.Serial,
     bin_path: str,
-    base_addr: int = APP_BASE_ADDRESS,
+    slot: str = 'A',
+    base_addr: int = None,
     skip_erase: bool = False,
     skip_verify: bool = False,
     resume: bool = False,
+    switch_after: bool = True,
 ) -> None:
     """
     Complete firmware flash workflow:
       1. Read file (.bin or .xbin), parse/auto-generate magic header
-      2. ERASE magic header area + APP area
-      3. PROGRAM: magic header to 0x0800C000, firmware to APP address
+      2. ERASE header + APP region (combined, sector-safe)
+      3. PROGRAM: magic header to header_addr, firmware to APP address
       4. VERIFY: firmware CRC32
-      5. BOOT
+      5. SWITCH_SLOT + RESET (default) or BOOT
 
     Args:
-      ser:        Open serial port object
-      bin_path:   Path to .bin or .xbin firmware file
-      base_addr:  Override APP base address (only for .bin, ignored for .xbin)
-      skip_erase: Skip erase step (debug only)
-      skip_verify: Skip verify step (debug only)
-      resume: Resume from <bin>.resume.json checkpoint if valid. Skips
-              already-finished stages; safe because re-programming the
-              same data is idempotent and ERASE is never repeated.
+      ser:          Open serial port object
+      bin_path:     Path to .bin or .xbin firmware file
+      slot:         'A' or 'B', determines header/app addresses (for .bin)
+      base_addr:    Override APP base address (only for .bin, ignored for .xbin)
+      skip_erase:   Skip erase step (debug only)
+      skip_verify:  Skip verify step (debug only)
+      resume:       Resume from <bin>.resume.json checkpoint if valid
+      switch_after: After flash, switch to this slot and reset (default True).
+                    Set False to just send BOOT (legacy behavior).
     """
 
     _t0 = time.time()
+
+    s = slot.upper()
+    if s not in SLOTS:
+        raise ValueError(f"Invalid slot: {slot} (must be A or B)")
+    slot_cfg = SLOTS[s]
 
     # ---- 1. Read and parse file ----
     if not os.path.exists(bin_path):
@@ -359,18 +426,20 @@ def flash_firmware(
 
     if file_type == 'xbin':
         header_bytes, firmware, data_address, data_length, data_crc32 = parse_xbin(raw_data)
+        header_addr = struct.unpack_from('<I', header_bytes, 248)[0]
         print(f"File: {bin_path} (.xbin with magic header)")
-        print(f"  Header: {len(header_bytes)} B")
+        print(f"  Header: {len(header_bytes)} B @ 0x{header_addr:08X}")
         print(f"  Firmware: {data_length} B @ 0x{data_address:08X}")
         print(f"  Firmware CRC32: 0x{data_crc32:08X}")
     else:
-        # Raw .bin: auto-generate magic header
+        # Raw .bin: auto-generate magic header for the target slot
         firmware = raw_data
-        data_address = base_addr
+        header_addr = slot_cfg['header_addr']
+        data_address = base_addr if base_addr is not None else slot_cfg['app_addr']
         data_length = len(firmware)
-        print(f"File: {bin_path} (.bin, auto-generating magic header)")
-        print(f"  Firmware: {len(firmware)} B @ 0x{data_address:08X}")
-        header_bytes = generate_magic_header(firmware)
+        print(f"File: {bin_path} (.bin, slot {s}, auto-generating magic header)")
+        print(f"  Header: 0x{header_addr:08X}, Firmware: {len(firmware)} B @ 0x{data_address:08X}")
+        header_bytes = generate_magic_header(firmware, slot=s)
         print(f"  Header: {len(header_bytes)} B (auto-generated)")
 
     if len(firmware) == 0:
@@ -383,6 +452,12 @@ def flash_firmware(
 
     # Recalculate CRC32 on padded firmware
     fw_crc32 = crc32(firmware)
+
+    # 边界检查：不能超出槽位大小
+    if data_address >= slot_cfg['app_addr'] and data_length > slot_cfg['app_size']:
+        raise ValueError(
+            f"Firmware too large for slot {s}: {data_length} B > {slot_cfg['app_size']} B"
+        )
 
     # ---- Resume checkpoint ----
     resume_stage = None
@@ -406,21 +481,19 @@ def flash_firmware(
         print("  (INQUERY not supported, using defaults)")
         actual_chunk = CHUNK_SIZE
 
-    # ---- 3. ERASE ----
+    # ---- 3. ERASE (combined: header + APP, sector-safe) ----
+    erase_start = min(header_addr, data_address)
+    erase_end = max(header_addr + len(header_bytes), data_address + data_length)
+    erase_size = erase_end - erase_start
+
     if skip_erase:
         print("ERASE: SKIPPED (--skip-erase)")
     elif resume_stage is not None:
         print("ERASE: SKIPPED (resuming, flash already erased)")
     else:
-        # Erase magic header area
-        print(f"Erasing magic header 0x{MAGIC_HEADER_ADDRESS:08X} +{MAGIC_HEADER_SIZE}...")
-        erase(ser, MAGIC_HEADER_ADDRESS, MAGIC_HEADER_SIZE)
-        print("  Header erase: ACK")
-
-        # Erase APP area
-        print(f"Erasing APP region 0x{data_address:08X} +{data_length}...")
-        erase(ser, data_address, data_length)
-        print("  APP erase: ACK (synchronous erase complete)")
+        print(f"Erasing 0x{erase_start:08X} +{erase_size} (header + APP)...")
+        erase(ser, erase_start, erase_size)
+        print("  Erase: ACK (synchronous erase complete)")
         # 擦除完成才落盘:之后续传绝不再擦除
         _save_checkpoint(bin_path, "erased", 0, data_address, data_length, firmware)
 
@@ -428,11 +501,11 @@ def flash_firmware(
     if resume_stage in ("header_done", "firmware"):
         print("Header: SKIPPED (resuming, already programmed)")
     else:
-        print(f"Programming magic header to 0x{MAGIC_HEADER_ADDRESS:08X} ({len(header_bytes)} B)...")
+        print(f"Programming magic header to 0x{header_addr:08X} ({len(header_bytes)} B)...")
         hdr_offset = 0
         while hdr_offset < len(header_bytes):
             chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
-            program(ser, MAGIC_HEADER_ADDRESS + hdr_offset, chunk)
+            program(ser, header_addr + hdr_offset, chunk)
             hdr_offset += len(chunk)
         print("  Header: OK")
         _save_checkpoint(bin_path, "header_done", 0, data_address, data_length, firmware)
@@ -473,9 +546,17 @@ def flash_firmware(
         verify(ser, data_address, total, fw_crc32)
         print(f"VERIFY: OK (CRC32 = 0x{fw_crc32:08X})")
 
-    # ---- 7. BOOT ----
-    print("Booting application...")
-    boot(ser)
-    print("BOOT: OK")
+    # ---- 7. Switch & reboot / boot ----
+    if switch_after:
+        print(f"Switching to slot {s} (pending_slot={0 if s == 'A' else 1})...")
+        switch_slot(ser, s)
+        print("SWITCH_SLOT: OK")
+        print("Rebooting...")
+        reset(ser)
+        print("RESET: OK (bootloader will boot slot %s)" % s)
+    else:
+        print("Booting application...")
+        boot(ser)
+        print("BOOT: OK")
     _clear_checkpoint(bin_path)
     print("\n=== Firmware upgrade completed successfully! (elapsed %.2f s) ===" % (time.time() - _t0))

@@ -6,15 +6,15 @@ import serial, serial.tools.list_ports
 from protocol import (
     open_serial, send_and_recv, crc32,
     OPCODE_INQUERY, OPCODE_ERASE, OPCODE_PROGRAM, OPCODE_VERIFY,
-    OPCODE_BOOT, OPCODE_RESET,
-    INQUERY_SUBCODE_VERSION, INQUERY_SUBCODE_MTU,
-    ERR_OK, ERROR_NAMES,
+    OPCODE_BOOT, OPCODE_RESET, OPCODE_SWITCH_SLOT,
+    INQUERY_SUBCODE_VERSION, INQUERY_SUBCODE_MTU, INQUERY_SUBCODE_SLOT_STATUS,
+    ERR_OK, ERR_PARAM, ERROR_NAMES,
     CHUNK_SIZE, DEFAULT_BAUDRATE, DEFAULT_TIMEOUT,
 )
 from flasher import (
-    APP_BASE_ADDRESS, APP_MAX_SIZE,
+    APP_BASE_ADDRESS, APP_MAX_SIZE, SLOTS,
     MAGIC_HEADER_ADDRESS, MAGIC_HEADER_SIZE,
-    parse_xbin, generate_magic_header,
+    parse_xbin, generate_magic_header, switch_slot, inquery_slot_status,
     _align4, program_stream,
     _save_checkpoint, _load_checkpoint, _clear_checkpoint,
 )
@@ -22,10 +22,10 @@ MSG_LOG, MSG_PROGRESS, MSG_DONE = "LOG", "PROGRESS", "DONE"
 
 
 class FlashWorker(threading.Thread):
-    def __init__(self, q, port, baud, bin_path, base_addr, skip_erase, skip_verify, resume=False):
+    def __init__(self, q, port, baud, bin_path, base_addr, slot, skip_erase, skip_verify, resume=False):
         super().__init__(daemon=True)
         self.q = q; self.port = port; self.baud = baud
-        self.bin_path = bin_path; self.base_addr = base_addr
+        self.bin_path = bin_path; self.base_addr = base_addr; self.slot = slot
         self.skip_erase = skip_erase; self.skip_verify = skip_verify
         self.resume = resume
         self._cancel = False
@@ -43,6 +43,11 @@ class FlashWorker(threading.Thread):
             self._log("Connected: %s" % self.port)
             t0 = time.time()
 
+            s = self.slot.upper()
+            if s not in SLOTS:
+                raise ValueError("Invalid slot: %s (must be A or B)" % self.slot)
+            slot_cfg = SLOTS[s]
+
             # ---- Read and parse file ----
             if not os.path.exists(self.bin_path):
                 raise FileNotFoundError("File not found: " + self.bin_path)
@@ -52,6 +57,7 @@ class FlashWorker(threading.Thread):
             ext = os.path.splitext(self.bin_path)[1].lower()
             if ext == '.xbin':
                 header_bytes, firmware, data_address, data_length, data_crc32 = parse_xbin(raw_data)
+                header_addr = struct.unpack_from('<I', header_bytes, 248)[0]
                 self._log("File: %s (.xbin with magic header)" % os.path.basename(self.bin_path))
                 # 解析并显示 magic header 各字段
                 hdr_magic      = struct.unpack_from('<I', header_bytes, 0)[0]
@@ -68,15 +74,16 @@ class FlashWorker(threading.Thread):
                 self._log("  data_crc32:   0x%08X" % data_crc32)
                 self._log("  this_crc32:   0x%08X" % hdr_hdr_crc)
                 self._log("  version:      %s" % hdr_ver)
-                self._log("  Header: %d B" % len(header_bytes))
+                self._log("  Header: %d B @ 0x%08X" % (len(header_bytes), header_addr))
                 self._log("  Firmware: %d B @ 0x%08X" % (data_length, data_address))
             else:
                 firmware = raw_data
-                data_address = self.base_addr
+                header_addr = slot_cfg['header_addr']
+                data_address = self.base_addr if self.base_addr is not None else slot_cfg['app_addr']
                 data_length = len(firmware)
-                self._log("File: %s (.bin, auto-generating magic header)" % os.path.basename(self.bin_path))
-                self._log("  Firmware: %d B @ 0x%08X" % (len(firmware), data_address))
-                header_bytes = generate_magic_header(firmware)
+                self._log("File: %s (.bin, slot %s, auto-generating magic header)" % (os.path.basename(self.bin_path), s))
+                self._log("  Header: 0x%08X, Firmware: %d B @ 0x%08X" % (header_addr, len(firmware), data_address))
+                header_bytes = generate_magic_header(firmware, slot=s)
                 self._log("  Header: %d B (auto-generated)" % len(header_bytes))
 
             if len(firmware) == 0:
@@ -109,34 +116,31 @@ class FlashWorker(threading.Thread):
                 self._log("  (using default chunk size)")
                 actual_chunk = CHUNK_SIZE
 
-            # ---- ERASE ----
+            # ---- ERASE (combined: header + APP) ----
+            erase_start = min(header_addr, data_address)
+            erase_end = max(header_addr + len(header_bytes), data_address + data_length)
+            erase_size = erase_end - erase_start
             if self.skip_erase:
                 self._log("ERASE: SKIPPED")
             elif resume_stage is not None:
                 self._log("ERASE: SKIPPED (resuming, flash already erased)")
             else:
-                self._log("Erasing magic header 0x%08X +%d..." % (MAGIC_HEADER_ADDRESS, MAGIC_HEADER_SIZE))
-                payload = struct.pack('<II', MAGIC_HEADER_ADDRESS, MAGIC_HEADER_SIZE)
+                self._log("Erasing 0x%08X +%d (header + APP)..." % (erase_start, erase_size))
+                payload = struct.pack('<II', erase_start, erase_size)
                 errcode, _ = send_and_recv(ser, OPCODE_ERASE, payload)
-                self._check_errcode(errcode, "ERASE HEADER")
-                self._log("  Header erase: OK")
-
-                self._log("Erasing APP region 0x%08X +%d..." % (data_address, data_length))
-                payload = struct.pack('<II', data_address, data_length)
-                errcode, _ = send_and_recv(ser, OPCODE_ERASE, payload)
-                self._check_errcode(errcode, "ERASE APP")
-                self._log("  APP erase: OK (synchronous erase complete)")
+                self._check_errcode(errcode, "ERASE")
+                self._log("  Erase: OK (synchronous erase complete)")
                 _save_checkpoint(self.bin_path, "erased", 0, data_address, data_length, firmware)
 
             # ---- PROGRAM Magic Header ----
             if resume_stage in ("header_done", "firmware"):
                 self._log("Header: SKIPPED (resuming, already programmed)")
             else:
-                self._log("Programming magic header to 0x%08X (%d B)..." % (MAGIC_HEADER_ADDRESS, len(header_bytes)))
+                self._log("Programming magic header to 0x%08X (%d B)..." % (header_addr, len(header_bytes)))
                 hdr_offset = 0
                 while hdr_offset < len(header_bytes) and not self._cancel:
                     chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
-                    payload = struct.pack('<II', MAGIC_HEADER_ADDRESS + hdr_offset, len(chunk)) + chunk
+                    payload = struct.pack('<II', header_addr + hdr_offset, len(chunk)) + chunk
                     errcode, _ = send_and_recv(ser, OPCODE_PROGRAM, payload)
                     self._check_errcode(errcode, "PROGRAM HEADER")
                     hdr_offset += len(chunk)
@@ -185,11 +189,14 @@ class FlashWorker(threading.Thread):
                 self._check_errcode(errcode, "VERIFY")
                 self._log("VERIFY: OK (CRC32=0x%08X)" % fw_crc32)
 
-            # ---- BOOT ----
-            self._log("Booting...")
-            errcode, _ = send_and_recv(ser, OPCODE_BOOT, b'')
-            self._check_errcode(errcode, "BOOT")
-            self._log("BOOT: OK")
+            # ---- Switch & reset (boot into the newly-flashed slot) ----
+            self._log("Switching to slot %s..." % s)
+            target = switch_slot(ser, s)
+            self._log("SWITCH_SLOT: OK (pending=%d)" % target)
+            self._log("Rebooting...")
+            errcode, _ = send_and_recv(ser, OPCODE_RESET, b'')
+            self._check_errcode(errcode, "RESET")
+            self._log("RESET: OK (bootloader will boot slot %s)" % s)
             _clear_checkpoint(self.bin_path)
             self._log("=== UPGRADE SUCCESS (%.2f s) ===" % (time.time() - t0))
             self.q.put((MSG_DONE, True, "Success"))
@@ -231,6 +238,20 @@ class SimpleWorker(threading.Thread):
                 e, _ = send_and_recv(ser, OPCODE_RESET, b'')
                 self._check(e, "RESET")
                 self._log("RESET: OK")
+            elif self.cmd == "switch_A":
+                t = switch_slot(ser, "A")
+                self._log("SWITCH_SLOT: OK (pending=%d, 0=A)" % t)
+            elif self.cmd == "switch_B":
+                t = switch_slot(ser, "B")
+                self._log("SWITCH_SLOT: OK (pending=%d, 1=B)" % t)
+            elif self.cmd == "status":
+                st = inquery_slot_status(ser)
+                nm = {0: 'A', 1: 'B', 0xFF: 'None'}
+                self._log("Active slot : %s" % nm.get(st['active'], st['active']))
+                self._log("Pending slot: %s" % nm.get(st['pending'], st['pending']))
+                self._log("Boot attempts: %d" % st['boot_attempts'])
+                self._log("Slot A valid: %s" % ("YES" if st['valid_mask'] & 0x01 else "NO"))
+                self._log("Slot B valid: %s" % ("YES" if st['valid_mask'] & 0x02 else "NO"))
             self.q.put((MSG_DONE, True, "Done"))
         except Exception as e:
             self._log("ERROR: " + str(e))
@@ -369,6 +390,12 @@ class BootloaderGUI:
         ttk.Entry(r1, textvariable=self.file_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         ttk.Button(r1, text='浏览', command=self._browse_file).pack(side=tk.LEFT)
         r2 = tk.Frame(fw_frame, bg=CARD_BG); r2.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(r2, text='槽位:').pack(side=tk.LEFT)
+        self.slot_var = tk.StringVar(value='A')
+        self.slot_combo = ttk.Combobox(r2, textvariable=self.slot_var, width=4, state='readonly',
+                     values=['A', 'B'])
+        self.slot_combo.pack(side=tk.LEFT, padx=(6, 12))
+        self.slot_var.trace_add('write', self._on_slot_change)
         ttk.Label(r2, text='地址(.bin):').pack(side=tk.LEFT)
         self.addr_var = tk.StringVar(value='0x%08X' % APP_BASE_ADDRESS)
         ttk.Entry(r2, textvariable=self.addr_var, width=14, font=('Consolas', 9)).pack(side=tk.LEFT, padx=6)
@@ -378,13 +405,27 @@ class BootloaderGUI:
         ttk.Checkbutton(r2, text='断点续传', variable=self.resume_var).pack(side=tk.LEFT, padx=10)
         self.skip_verify_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(r2, text='跳过校验', variable=self.skip_verify_var).pack(side=tk.LEFT, padx=10)
+        r3 = tk.Frame(fw_frame, bg=CARD_BG); r3.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(r3, text='版本:').pack(side=tk.LEFT)
+        self.version_var = tk.StringVar(value="")
+        ttk.Entry(r3, textvariable=self.version_var, width=24).pack(side=tk.LEFT, padx=6)
+        ttk.Label(r3, text='(生成 Header 用，留空=自动)', font=('Segoe UI', 8),
+                  foreground=TEXT_SECONDARY).pack(side=tk.LEFT)
+
+        btn_row = tk.Frame(fw_frame, bg=CARD_BG); btn_row.pack(pady=(6, 0))
         self.flash_btn = tk.Button(
-            fw_frame, text='烧录固件', command=self._start_flash,
+            btn_row, text='烧录固件', command=self._start_flash,
             font=('Segoe UI', 10, 'bold'), bg=ACCENT, fg='#ffffff',
             activebackground=ACCENT_HOVER, activeforeground='white',
             relief='flat', padx=24, pady=8, cursor='hand2'
         )
-        self.flash_btn.pack(pady=(6, 0))
+        self.flash_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.gen_header_btn = tk.Button(
+            btn_row, text='生成 Header 文件', command=self._generate_header,
+            font=('Segoe UI', 10), bg=CARD_BG, fg=TEXT_NORMAL,
+            activebackground='#e8e8e8', relief='flat', padx=16, pady=8, cursor='hand2'
+        )
+        self.gen_header_btn.pack(side=tk.LEFT)
 
         # 功能按钮
         cmd_frame = tk.Frame(main, bg=BG); cmd_frame.pack(fill=tk.X, pady=(0, 8))
@@ -407,6 +448,14 @@ class BootloaderGUI:
         reset_style['fg'] = COLOR_ERROR
         self.reset_btn = tk.Button(cmd_frame, text='复位', command=lambda: self._simple_cmd('reset'), **reset_style)
         self.reset_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        # 槽位查询/切换按钮
+        self.status_btn = tk.Button(cmd_frame, text='查询槽位', command=lambda: self._simple_cmd('status'), **btn_style)
+        self.status_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.switch_a_btn = tk.Button(cmd_frame, text='切到A', command=lambda: self._simple_cmd('switch_A'), **btn_style)
+        self.switch_a_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.switch_b_btn = tk.Button(cmd_frame, text='切到B', command=lambda: self._simple_cmd('switch_B'), **btn_style)
+        self.switch_b_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         # 取消按钮
         cancel_style = btn_style.copy()
@@ -451,6 +500,44 @@ class BootloaderGUI:
         if ports and not self.port_var.get():
             self.port_var.set(ports[0])
 
+    def _on_slot_change(self, *args):
+        s = self.slot_var.get().strip().upper()
+        if s in SLOTS:
+            self.addr_var.set('0x%08X' % SLOTS[s]['app_addr'])
+
+    def _generate_header(self):
+        """从当前选择的 .bin 文件生成 Magic Header 文件（本地操作，不连串口）"""
+        path = self.file_var.get().strip()
+        if not path:
+            messagebox.showwarning('警告', '请先选择固件文件'); return
+        if not os.path.exists(path):
+            messagebox.showerror('错误', '文件不存在: ' + path); return
+        slot = self.slot_var.get().strip().upper() or 'A'
+        if slot not in ('A', 'B'):
+            messagebox.showerror('错误', '槽位必须是 A 或 B'); return
+        version = self.version_var.get().strip() or None
+
+        try:
+            with open(path, 'rb') as f:
+                fw = f.read()
+            if len(fw) == 0:
+                messagebox.showerror('错误', '固件文件为空'); return
+
+            header = generate_magic_header(fw, slot=slot, version=version)
+            out = os.path.splitext(path)[0] + '_header.bin'
+            with open(out, 'wb') as f:
+                f.write(header)
+
+            self._log('-' * 40)
+            self._log('生成 Header 文件: %s' % out, 'OK')
+            self._log('  slot: %s (header 0x%08X, app 0x%08X)' % (
+                slot, SLOTS[slot]['header_addr'], SLOTS[slot]['app_addr']))
+            self._log('  firmware: %d B, header: %d B' % (len(fw), len(header)))
+            self.progress_label.configure(text='Header 已生成')
+            messagebox.showinfo('完成', 'Header 已生成:\n' + out)
+        except Exception as e:
+            messagebox.showerror('错误', str(e))
+
     def _browse_file(self):
         path = filedialog.askopenfilename(
             title='选择固件文件',
@@ -471,7 +558,8 @@ class BootloaderGUI:
 
     def _set_ui_state(self, busy):
         state = tk.DISABLED if busy else tk.NORMAL
-        for b in [self.flash_btn, self.inquery_btn, self.boot_btn, self.reset_btn]:
+        for b in [self.flash_btn, self.inquery_btn, self.boot_btn, self.reset_btn,
+                  self.status_btn, self.switch_a_btn, self.switch_b_btn]:
             b.configure(state=state)
         self.cancel_btn.configure(state=tk.NORMAL if busy else tk.DISABLED)
         self.port_combo.configure(state='readonly' if not busy else tk.DISABLED)
@@ -489,14 +577,17 @@ class BootloaderGUI:
         if not path: messagebox.showwarning('警告', '请先选择固件文件'); return
         try: addr = int(self.addr_var.get(), 0)
         except ValueError: messagebox.showerror('错误', '地址格式无效'); return
+        slot = self.slot_var.get().strip().upper() or 'A'
+        if slot not in ('A', 'B'):
+            messagebox.showerror('错误', '槽位必须是 A 或 B'); return
         baud = int(self.baud_var.get())
         self._set_ui_state(True)
         self.progress_var.set(0)
         self.progress_label.configure(text='Preparing...')
         self.log_text.configure(state=tk.NORMAL); self.log_text.delete(1.0, tk.END); self.log_text.configure(state=tk.DISABLED)
         self._log('=' * 50)
-        self._log('开始固件烧录...')
-        self.worker = FlashWorker(self.msg_queue, port, baud, path, addr, self.skip_erase_var.get(), self.skip_verify_var.get(), self.resume_var.get())
+        self._log('开始固件烧录 (Slot %s)...' % slot)
+        self.worker = FlashWorker(self.msg_queue, port, baud, path, addr, slot, self.skip_erase_var.get(), self.skip_verify_var.get(), self.resume_var.get())
         self.worker.start()
 
     def _simple_cmd(self, cmd):
@@ -505,7 +596,8 @@ class BootloaderGUI:
         baud = int(self.baud_var.get())
         self._set_ui_state(True); self.progress_var.set(0)
         self._log('-' * 40)
-        names = {'inquery': 'Query', 'boot': 'Boot', 'reset': 'Reset'}
+        names = {'inquery': 'Query', 'boot': 'Boot', 'reset': 'Reset',
+                 'status': 'Query Slot Status', 'switch_A': 'Switch to A', 'switch_B': 'Switch to B'}
         self._log('执行: %s...' % names.get(cmd, cmd))
         self.worker = SimpleWorker(self.msg_queue, port, baud, cmd)
         self.worker.start()

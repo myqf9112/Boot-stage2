@@ -44,6 +44,8 @@ OPCODE_BOOT    = 0x22
 
 OPCODE_RESET   = 0x23
 
+OPCODE_SWITCH_SLOT = 0x24
+
 
 
 # INQUERY subcodes
@@ -51,6 +53,8 @@ OPCODE_RESET   = 0x23
 INQUERY_SUBCODE_VERSION = 0x00
 
 INQUERY_SUBCODE_MTU     = 0x01
+
+INQUERY_SUBCODE_SLOT_STATUS = 0x02
 
 
 
@@ -69,6 +73,8 @@ ERR_FORMAT   = 0x04
 ERR_VERIFY   = 0x05
 
 ERR_PARAM    = 0x06
+
+ERR_FLASH    = 0x07
 
 ERR_UNKNOWN  = 0xFF
 
@@ -89,6 +95,8 @@ ERROR_NAMES = {
     0x05: "VERIFY",
 
     0x06: "PARAM",
+
+    0x07: "FLASH",
 
     0xFF: "UNKNOWN",
 
@@ -476,7 +484,7 @@ def send_and_recv(ser: serial.Serial, opcode: int, payload: bytes,
 
         0x01: "INQUERY", 0x81: "ERASE", 0x82: "PROGRAM",
 
-        0x33: "VERIFY", 0x22: "BOOT", 0x23: "RESET",
+        0x33: "VERIFY", 0x22: "BOOT", 0x23: "RESET", 0x24: "SWITCH_SLOT",
 
     }
 

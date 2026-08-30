@@ -3,6 +3,7 @@
 #include "stm32f4xx_ll_tim.h"
 #include "stm32f4xx_ll_rcc.h"
 #include "stm32f4xx_ll_bus.h"
+#include "stm32f4xx_ll_iwdg.h"
 #include "tim_delay.h"
 
 static volatile uint64_t tim_tick_count;
@@ -45,8 +46,7 @@ uint64_t tim_get_us(void)
 
 uint64_t tim_get_ms(void)
 {
-    return tim_now() /
-     1000;
+    return tim_now() /1000;
 }
 
 void tim_delay_us(uint32_t us)

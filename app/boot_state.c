@@ -48,7 +48,7 @@ void boot_state_write(const boot_state_t *state)
     local_state.crc32 = 0;
     local_state.crc32 = crc32((uint8_t *)(&local_state), offset_of(boot_state_t, crc32));
     stm32_flash_unlock();
-    if(!stm32_flash_erase(BOOT_STATE_ADDRESS, 16 * 1024))// 擦除16KB的boot_state存储区域
+    if(!stm32_flash_erase(BOOT_STATE_ADDRESS, BOOT_STATE_SIZE))// 擦除16KB的boot_state存储区域
     {
         log_e("Failed to erase boot state");
         stm32_flash_lock();

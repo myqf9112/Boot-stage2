@@ -1,4 +1,6 @@
 #include "stm32f4xx_ll_tim.h"
+#include "stm32f4xx_ll_iwdg.h"
+#include "stm32f4xx_ll_rcc.h"
 #include "stm32f4xx_ll_usart.h"
 #include "stm32f4xx_ll_dma.h"
 #include <stdbool.h>
@@ -26,7 +28,7 @@
 #define PACKET_SIZE_MAX (4 + PAYLOAD_SIZE_MAX + 2) // header(1) + opcode(1) + length(2) + payload + crc16(2)
 #define RX_BUFFER_SIZE (8 * 1024)
 #define RX_TIMEOUT_MS 20
-#define BL_VERSION "0.9.9"
+#define BL_VERSION "1.0.0"
 #define PAYLOAD_SIZE_MAX (4096 + 8) // 4096 program data + 8 bytes for address and size
 #define BOOT_DELAY 3000             //  boot delay (上位机连接窗口)
 #define KEY_HOLD_TRAP_MS 1500       // 按键进入 bootloader 需连续按住的时间(ms)
@@ -63,12 +65,14 @@ typedef enum
     PACKET_OPCODE_VERIFY = 0x33,
     PACKET_OPCODE_BOOT = 0x22,
     PACKET_OPCODE_RESET = 0x23,
+    PACKET_OPCODE_SWITCH_SLOT = 0x24,
 } packet_opcode_t;
 
 typedef enum
 {
     INQUERY_SUBCODE_VERSION = 0x00,
     INQUERY_SUBCODE_MTU = 0x01,
+    INQUERY_SUBCODE_SLOT_STATUS = 0x02,
 } packet_inquery_subcode_t;
 
 typedef enum
@@ -108,12 +112,14 @@ static uint32_t slot_header_address(boot_slot_t slot)
 static bool slot_validate(boot_slot_t slot)
 {
     uint32_t header_address = slot_header_address(slot);
-    if (header_address == 0) {
+    if (header_address == 0)
+    {
         log_e("Invalid slot %d", slot);
         return false;
     }
 
-    if (!magic_header_validate(header_address)) {
+    if (!magic_header_validate(header_address))
+    {
         log_w("Slot %d magic header invalid", slot);
         return false;
     }
@@ -124,7 +130,8 @@ static bool slot_validate(boot_slot_t slot)
     uint32_t stored_crc = magic_header_get_crc32(header_address);
     uint32_t calc_crc = crc32((const uint8_t *)addr, size);
 
-    if (stored_crc != calc_crc) {
+    if (stored_crc != calc_crc)
+    {
         log_w("Slot %d CRC32 mismatch: expected 0x%08X, got 0x%08X", slot, stored_crc, calc_crc);
         return false;
     }
@@ -231,6 +238,17 @@ static void bl_opcode_inquery_handler(void)
         bl_response(PACKET_OPCODE_INQUERY, RESPONSE_ERRORCODE_OK, (const uint8_t *)bmtu, sizeof(bmtu));
         break;
     }
+    case INQUERY_SUBCODE_SLOT_STATUS:
+    {
+        boot_state_t st = boot_state_read();
+        uint8_t resp[4];
+        resp[0] = st.active_slot;                                                              // 当前启动槽
+        resp[1] = st.pending_slot;                                                             // 待切换槽
+        resp[2] = st.boot_attempts;                                                            // 当前槽连续看门狗复位次数
+        resp[3] = (slot_validate(BOOT_SLOT_A) ? 1 : 0) | (slot_validate(BOOT_SLOT_B) ? 2 : 0); // 位掩码：bit0=A有效, bit1=B有效
+        bl_response(PACKET_OPCODE_INQUERY, RESPONSE_ERRORCODE_OK, (const uint8_t *)resp, sizeof(resp));
+        break;
+    }
     default:
         log_w("Unknown INQUERY subcode: %02X", subcode);
         break;
@@ -267,7 +285,11 @@ static void bl_opcode_erase_handler(void)
     address = get_u32(&packet_buffer[4]);
     // size = (packet_buffer[11] << 24) | (packet_buffer[10] << 16) | (packet_buffer[9] << 8) | packet_buffer[8];
     size = get_u32(&packet_buffer[8]);
-    if (address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE)
+    uint32_t end_address = address + size;
+    if ((address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE) ||
+        (address >= BOOT_STATE_ADDRESS && address < BOOT_STATE_ADDRESS + BOOT_STATE_SIZE) ||
+        (end_address > BL_ADDRESS && end_address <= BL_ADDRESS + BL_SIZE) ||
+        (end_address > BOOT_STATE_ADDRESS && end_address <= BOOT_STATE_ADDRESS + BOOT_STATE_SIZE))
     {
         log_w("address %08X is protected", address);
         bl_response(PACKET_OPCODE_ERASE, RESPONSE_ERRORCODE_PARAM, NULL, 0);
@@ -298,7 +320,11 @@ static void bl_opcode_program_handler(void)
     // size = (packet_buffer[11] << 24) | (packet_buffer[10] << 16) | (packet_buffer[9] << 8) | packet_buffer[8];
     size = get_u32(&packet_buffer[8]);
     uint8_t *data = &packet_buffer[12];
-    if (address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE)
+    uint32_t end_address = address + size;
+    if ((address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE) ||
+        (address >= BOOT_STATE_ADDRESS && address < BOOT_STATE_ADDRESS + BOOT_STATE_SIZE) ||
+        (end_address > BL_ADDRESS && end_address <= BL_ADDRESS + BL_SIZE) ||
+        (end_address > BOOT_STATE_ADDRESS && end_address <= BOOT_STATE_ADDRESS + BOOT_STATE_SIZE))
     {
         log_w("address %08X is protected", address);
         bl_response(PACKET_OPCODE_PROGRAM, RESPONSE_ERRORCODE_PARAM, NULL, 0);
@@ -336,7 +362,8 @@ static void bl_opcode_verify_handler(void)
     // uint32_t crc = (packet_buffer[15] << 24) | (packet_buffer[14] << 16) | (packet_buffer[13] << 8) | packet_buffer[12];
     uint32_t crc;
     crc = get_u32(&packet_buffer[12]);
-    if (address < STM32_FLASH_BASE || address + size > STM32_FLASH_BASE + STM32_FLASH_SIZE)
+    uint32_t end_address = address + size;
+    if (address < STM32_FLASH_BASE || end_address > STM32_FLASH_BASE + STM32_FLASH_SIZE)
     {
         log_i("address %08X is protected", address);
         bl_response(PACKET_OPCODE_VERIFY, RESPONSE_ERRORCODE_PARAM, NULL, 0);
@@ -354,6 +381,39 @@ static void bl_opcode_verify_handler(void)
         log_i("Verify OK");
         bl_response(PACKET_OPCODE_VERIFY, RESPONSE_ERRORCODE_OK, NULL, 0);
     }
+}
+
+static void bl_opcode_switch_slot_handler(void)
+{
+    log_i("switch slot handler");
+    if (packet_payload_length != 1)
+    {
+        log_w("SWITCH_SLOT should have 1 byte payload, but got %u bytes", packet_payload_length);
+        bl_response(PACKET_OPCODE_SWITCH_SLOT, RESPONSE_ERRORCODE_PARAM, NULL, 0);
+        return;
+    }
+    boot_slot_t target = (boot_slot_t)packet_buffer[4];
+    if (target > BOOT_SLOT_B)
+    {
+        log_w("Invalid slot: %d", target);
+        bl_response(PACKET_OPCODE_SWITCH_SLOT, RESPONSE_ERRORCODE_PARAM, NULL, 0);
+        return;
+    }
+    boot_slot_t slot = (boot_slot_t)target;
+    if (!slot_validate(slot))
+    {
+        log_w("Slot %d is not valid, cannot switch", slot);
+        uint8_t err = 2;
+        bl_response(PACKET_OPCODE_SWITCH_SLOT, RESPONSE_ERRORCODE_PARAM, &err, 1);
+        return;
+    }
+    boot_state_t state = boot_state_read();
+    state.pending_slot = slot;
+    state.crc32 = crc32((uint8_t *)&state, offset_of(boot_state_t, crc32));
+    boot_state_write(&state);
+    log_i("Switching to slot %d on next boot", slot);
+    uint8_t resp = (uint8_t)slot;
+    bl_response(PACKET_OPCODE_SWITCH_SLOT, RESPONSE_ERRORCODE_OK, &resp, 1);
 }
 static void bl_packet_handler(void)
 {
@@ -386,7 +446,10 @@ static void bl_packet_handler(void)
         bl_opcode_reset_handler();
         log_d("Reset received");
         break;
-
+    case PACKET_OPCODE_SWITCH_SLOT:
+        bl_opcode_switch_slot_handler();
+        log_d("Switch slot received");
+        break;
     default:
         log_e("Unknown opcode received");
         break;
@@ -430,6 +493,7 @@ static bool bl_byte_handler(uint8_t byte)
             packet_buffer[1] == PACKET_OPCODE_PROGRAM ||
             packet_buffer[1] == PACKET_OPCODE_VERIFY ||
             packet_buffer[1] == PACKET_OPCODE_BOOT ||
+            packet_buffer[1] == PACKET_OPCODE_SWITCH_SLOT ||
             packet_buffer[1] == PACKET_OPCODE_RESET)
         {
             log_d("Opcode OK:%02X", packet_buffer[1]);
@@ -510,31 +574,6 @@ static void bl_usart_rx_handler(const uint8_t *data, uint32_t length)
     rb_puts(rxrb, data, length);
 }
 
-static bool key_trap_check(void)
-{
-    /* 窗口内连续按住 key1 达到 KEY_HOLD_TRAP_MS 即进入 bootloader;
-     * 中途松开则重新计时,窗口结束未达到则正常启动 APP */
-    uint32_t held_ms = 0;
-    for (uint32_t t = 0; t < BOOT_DELAY; t += 10)
-    {
-        tim_delay_ms(10);
-        if (key_read(key1))
-        {
-            held_ms += 10;
-            if (held_ms >= KEY_HOLD_TRAP_MS)
-            {
-                log_w("key held %u ms, trap into boot", (unsigned)held_ms);
-                return true;
-            }
-        }
-        else
-        {
-            held_ms = 0;
-        }
-    }
-    return false;
-}
-
 static void wait_key_release(void)
 {
     while (key_read(key1))
@@ -571,29 +610,102 @@ bool magic_header_trap_boot(void)
     return false;
 }
 
-bool rx_trap_boot(void)
+static bool combined_trap_check(void)
 {
-    for (uint32_t i = 0; i < BOOT_DELAY; i += 1)
-    {
-        tim_delay_ms(1);
+    uint32_t held_ms = 0;
+    for (uint32_t t = 0; t < BOOT_DELAY; t += 10)
+    { // 3s 总窗口，10ms 采样
+        tim_delay_ms(10);
+
+        // 按键检测
+        if (key_read(key1))
+        {
+            held_ms += 10;
+            if (held_ms >= KEY_HOLD_TRAP_MS)
+            {
+                log_w("Key held %u ms, trap into boot", held_ms);
+                return true;
+            }
+        }
+        else
+        {
+            held_ms = 0;
+        }
+
+        //  UART数据检测
         bl_usart_flush_rx();
         if (!rb_empty(rxrb))
         {
-            log_d("data received, trap into boot");
+            log_d("Data received, trap into boot");
             return true;
         }
     }
-
     return false;
 }
-
-void bootloader_main(void)
+/*
+ *根据boot_state选择启动槽
+ */
+static boot_slot_t select_boot_slot(const boot_state_t *st)
 {
 
-    boot_state_t st = boot_state_read();
-    log_i("boot_magic=%u active=%u pending=%u attempts=%u",
-          st.magic, st.active_slot, st.pending_slot, st.boot_attempts);
+    if (st->pending_slot != BOOT_PENDING_NONE)
+    {
+        return st->pending_slot;
+    }
+
+    if (st->active_slot != BOOT_PENDING_NONE)
+    {
+        return st->active_slot;
+    }
+    return BOOT_PENDING_NONE;
+}
+
+static bool try_boot_slot(boot_slot_t slot)
+{
+    // 固件有效性检查
+    if (!(slot_validate(slot)))
+    {
+        log_w("Slot %d validation failed", slot);
+        return false;
+    }
+    LL_IWDG_ReloadCounter(IWDG);
+    log_i("Booting slot %d", slot);
+    boot_slot(slot); // 跳转到应用程序，不返回
+    return true;
+}
+
+static void iwdg_init(void)
+{
+    uint32_t timeout;
+
+    LL_RCC_LSI_Enable();                              //  启用 LSI（IWDG 时钟源）
+    timeout = 1000000;
+    while (!LL_RCC_LSI_IsReady() && timeout-- > 0) {} //  等 LSI 就绪（约40us）
+    if (timeout == 0)
+        log_e("IWDG init: LSI not ready!");
+
+    LL_IWDG_Enable(IWDG);                             //  启动 IWDG（写 0xCCCC），LSI 会被强制保持开
+    LL_IWDG_EnableWriteAccess(IWDG);                  //  解锁
+    LL_IWDG_SetPrescaler(IWDG, LL_IWDG_PRESCALER_256); // 分频 32kHz/256=125Hz
+    LL_IWDG_SetReloadCounter(IWDG, 250);              //  重载值 250/125=2s
+
+    timeout = 1000000;
+    while (!LL_IWDG_IsReady(IWDG) && timeout-- > 0) {} // 等 PR/RLR 写入完成
+    if (timeout == 0)
+        log_e("IWDG init: PVU/RVU not cleared!");
+
+    LL_IWDG_ReloadCounter(IWDG);                      //  刷新
+    log_i("IWDG init OK");
+}
+static void feed_iwdg(void)
+{
+    LL_IWDG_ReloadCounter(IWDG);
+}
+void bootloader_main(void)
+{
     log_i("Bootloader started.\r");
+    tim_register_periodic_callback(feed_iwdg);
+    iwdg_init();
     key_init(key1);
     rxrb = rb_new(rb_buffer, RX_BUFFER_SIZE);
     bl_usart_init();
@@ -602,24 +714,45 @@ void bootloader_main(void)
     bool trapboot = false;
 
     if (!trapboot)
-        trapboot = key_trap_check();
+        trapboot = combined_trap_check();
 
     if (!trapboot)
-        trapboot = rx_trap_boot();
-
-   //if (!trapboot)
-   //    boot_application();
-
-  if (!trapboot) {
-        if (slot_validate(BOOT_SLOT_A)) {
-            boot_slot(BOOT_SLOT_A);   // 跳转，不返回
+    {
+        boot_state_t st = boot_state_read();
+        if (LL_RCC_IsActiveFlag_IWDGRST())
+        {
+            LL_RCC_ClearResetFlags();
+            if (st.boot_attempts < 3)
+            {
+                st.boot_attempts++;
+                log_w("IWDG reset detected, attempts=%u", st.boot_attempts);
+            }
+            else
+            {
+                st.active_slot = (st.active_slot == BOOT_SLOT_A) ? BOOT_SLOT_B : BOOT_SLOT_A;
+                st.pending_slot = BOOT_PENDING_NONE;
+                st.boot_attempts = 0;
+                log_w("3rd IWDG reset, auto-switch to slot %d", st.active_slot);
+            }
+            st.crc32 = crc32((uint8_t *)&st, offset_of(boot_state_t, crc32));
+            boot_state_write(&st);
         }
-        // A 无效则进入烧录模式（旧版本也是如此）
-        log_e("Slot A invalid, entering recovery mode");
-    } else {
-        log_i("Trap triggered, entering recovery mode");
+        boot_slot_t slot = select_boot_slot(&st);
+        if (slot != BOOT_PENDING_NONE && try_boot_slot(slot))
+        {
+            // 不返回
+        }
+        boot_slot_t fallback = (slot == BOOT_SLOT_A) ? BOOT_SLOT_B : BOOT_SLOT_A;
+        if (try_boot_slot(fallback))
+        {
+            // 不返回
+        }
+        log_i("No valid boot slot found, entering bootloader");
     }
-
+    else
+    {
+        log_i("Trap into bootloader");
+    }
 
     led_init(led1);
     led_on(led1);
@@ -630,7 +763,6 @@ void bootloader_main(void)
 
     while (1)
     {
-
         if (key_press_check())
         {
             log_i("key pressed,rebooting...");

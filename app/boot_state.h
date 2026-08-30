@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #define BOOT_STATE_ADDRESS    0X08008000 //boot_state存储地址
+#define BOOT_STATE_SIZE    (16 * 1024)
 #define BOOT_PENDING_NONE 0xFF // 无待切换槽
 typedef enum
 {
