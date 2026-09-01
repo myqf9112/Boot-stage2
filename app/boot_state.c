@@ -9,9 +9,10 @@
 
 #define LOG_TAG "boot_state"
 #define LOG_LVL ELOG_LVL_INFO
+
 bool boot_state_validate(const boot_state_t *state)
 {
-    if (!(state->magic == 0x424F4F54))
+    if (state->magic != BOOT_STATE_MAGIC)
     {
         log_e("Invalid magic header");
         return false; // 魔术头不合法
@@ -28,7 +29,7 @@ boot_state_t boot_state_read(void)
 {
     static const boot_state_t default_state =
         {
-            .magic = 0,
+            .magic = BOOT_STATE_MAGIC,
             .active_slot = BOOT_SLOT_A,
             .pending_slot = BOOT_PENDING_NONE,
             .boot_attempts = 0,
@@ -45,6 +46,7 @@ void boot_state_write(const boot_state_t *state)
     if (state == NULL)
         return;
     boot_state_t local_state = *state;
+    local_state.magic = BOOT_STATE_MAGIC; // 强制写入合法魔术头，防止调用方传入非法值
     local_state.crc32 = 0;
     local_state.crc32 = crc32((uint8_t *)(&local_state), offset_of(boot_state_t, crc32));
     stm32_flash_unlock();

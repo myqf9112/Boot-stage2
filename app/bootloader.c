@@ -96,6 +96,16 @@ static packet_opcode_t packet_opcode;
 static uint16_t packet_payload_length;
 static packet_state_machine_t packet_state = PACKET_STATE_HEADER;
 
+static boot_slot_t select_boot_slot(const boot_state_t *st);
+
+/* 校验 [address, address+size) 是否完整落在 Flash 范围内(防 uint32 溢出绕过) */
+static bool flash_range_check(uint32_t address, uint32_t size)
+{
+    return (address >= STM32_FLASH_BASE &&
+            address < STM32_FLASH_BASE + STM32_FLASH_SIZE &&
+            size <= STM32_FLASH_BASE + STM32_FLASH_SIZE - address);
+}
+
 static uint32_t slot_header_address(boot_slot_t slot)
 {
     switch (slot)
@@ -148,6 +158,8 @@ static void boot_slot(boot_slot_t slot)
     uint32_t app_address = magic_header_get_address(header_address);
     log_i("Booting slot %d, header at 0x%08X, app at 0x%08X", slot, header_address, app_address);
     log_i("Booting  application...");
+    /* 跳转前刷新 IWDG，给应用留满完整超时窗口；应用须在超时前接管喂狗 */
+    LL_IWDG_ReloadCounter(IWDG);
     tim_delay_ms(2);
     led_off(led1);
 
@@ -168,39 +180,7 @@ static void boot_slot(boot_slot_t slot)
     extern void JumpApp(uint32_t base);
     JumpApp(app_address);
 }
-static bool application_validate(void)
-{
-    if (!magic_header_validate(A_MAGICHEADER_ADDRESS))
-    {
-        log_e("Magic header invalid");
-        return false;
-    }
 
-    uint32_t addr = magic_header_get_address(A_MAGICHEADER_ADDRESS);
-    uint32_t size = magic_header_get_length(A_MAGICHEADER_ADDRESS);
-    uint32_t crc = magic_header_get_crc32(A_MAGICHEADER_ADDRESS);
-    uint32_t ccrc = crc32((const uint8_t *)addr, size);
-    if (crc != ccrc)
-    {
-        log_w("Application CRC32 mismatch: expected %08X, got %08X", crc, ccrc);
-        return false;
-    }
-
-    log_i("Application validated OK");
-    return true;
-}
-static void boot_application(void)
-{
-    if (!application_validate())
-    {
-        log_e("Application validate failed,catnot boot");
-        return;
-    }
-
-    SCB->VTOR = APP_BASE_ADDRESS;
-    extern void JumpApp(uint32_t base);
-    JumpApp(APP_BASE_ADDRESS);
-}
 static void bl_response(packet_opcode_t opcode, packet_errcode_t errcode,
                         const uint8_t *data, uint16_t length)
 {
@@ -267,7 +247,27 @@ static void bl_opcode_reset_handler(void)
 static void bl_opcode_boot_handler(void)
 {
     log_i("boot handler...");
+    if (packet_payload_length != 0)
+    {
+        log_w("BOOT should have no payload, but got %u bytes", packet_payload_length);
+        bl_response(PACKET_OPCODE_BOOT, RESPONSE_ERRORCODE_FORMAT, NULL, 0);
+        return;
+    }
+
+    /* 先回 ACK，再跳转，确保上位机能收到响应 */
     bl_response(PACKET_OPCODE_BOOT, RESPONSE_ERRORCODE_OK, NULL, 0);
+    tim_delay_ms(2);
+
+    boot_state_t st = boot_state_read();
+    boot_slot_t slot = select_boot_slot(&st);
+    if (slot == BOOT_PENDING_NONE)
+        slot = BOOT_SLOT_A;
+    if (!slot_validate(slot))
+    {
+        log_w("BOOT: slot %d invalid, stay in bootloader", slot);
+        return;
+    }
+    boot_slot(slot); // 跳转应用，不返回
 }
 
 static void bl_opcode_erase_handler(void)
@@ -286,6 +286,12 @@ static void bl_opcode_erase_handler(void)
     // size = (packet_buffer[11] << 24) | (packet_buffer[10] << 16) | (packet_buffer[9] << 8) | packet_buffer[8];
     size = get_u32(&packet_buffer[8]);
     uint32_t end_address = address + size;
+    if (!flash_range_check(address, size))
+    {
+        log_w("ERASE address %08X + size %u out of flash range", address, size);
+        bl_response(PACKET_OPCODE_ERASE, RESPONSE_ERRORCODE_PARAM, NULL, 0);
+        return;
+    }
     if ((address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE) ||
         (address >= BOOT_STATE_ADDRESS && address < BOOT_STATE_ADDRESS + BOOT_STATE_SIZE) ||
         (end_address > BL_ADDRESS && end_address <= BL_ADDRESS + BL_SIZE) ||
@@ -321,6 +327,12 @@ static void bl_opcode_program_handler(void)
     size = get_u32(&packet_buffer[8]);
     uint8_t *data = &packet_buffer[12];
     uint32_t end_address = address + size;
+    if (!flash_range_check(address, size))
+    {
+        log_w("PROGRAM address %08X + size %u out of flash range", address, size);
+        bl_response(PACKET_OPCODE_PROGRAM, RESPONSE_ERRORCODE_PARAM, NULL, 0);
+        return;
+    }
     if ((address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE) ||
         (address >= BOOT_STATE_ADDRESS && address < BOOT_STATE_ADDRESS + BOOT_STATE_SIZE) ||
         (end_address > BL_ADDRESS && end_address <= BL_ADDRESS + BL_SIZE) ||
@@ -328,6 +340,12 @@ static void bl_opcode_program_handler(void)
     {
         log_w("address %08X is protected", address);
         bl_response(PACKET_OPCODE_PROGRAM, RESPONSE_ERRORCODE_PARAM, NULL, 0);
+        return;
+    }
+    if (size % 4 != 0)
+    {
+        log_w("PROGRAM size must be 4-byte aligned, got %u", size);
+        bl_response(PACKET_OPCODE_PROGRAM, RESPONSE_ERRORCODE_FORMAT, NULL, 0);
         return;
     }
     if (size != packet_payload_length - 8)
@@ -362,10 +380,9 @@ static void bl_opcode_verify_handler(void)
     // uint32_t crc = (packet_buffer[15] << 24) | (packet_buffer[14] << 16) | (packet_buffer[13] << 8) | packet_buffer[12];
     uint32_t crc;
     crc = get_u32(&packet_buffer[12]);
-    uint32_t end_address = address + size;
-    if (address < STM32_FLASH_BASE || end_address > STM32_FLASH_BASE + STM32_FLASH_SIZE)
+    if (!flash_range_check(address, size))
     {
-        log_i("address %08X is protected", address);
+        log_w("VERIFY address %08X + size %u out of flash range", address, size);
         bl_response(PACKET_OPCODE_VERIFY, RESPONSE_ERRORCODE_PARAM, NULL, 0);
         return;
     }
@@ -592,24 +609,6 @@ static bool key_press_check(void)
     return true;
 }
 
-bool magic_header_trap_boot(void)
-{
-
-    if (!magic_header_validate(A_MAGICHEADER_ADDRESS))
-    {
-        log_e("Magic header invalid, skip trap");
-        return true;
-    }
-
-    if (!application_validate())
-    {
-        log_e("Application invalid, trap into bootloader");
-        return true;
-    }
-
-    return false;
-}
-
 static bool combined_trap_check(void)
 {
     uint32_t held_ms = 0;
@@ -687,7 +686,13 @@ static void iwdg_init(void)
     LL_IWDG_Enable(IWDG);                             //  启动 IWDG（写 0xCCCC），LSI 会被强制保持开
     LL_IWDG_EnableWriteAccess(IWDG);                  //  解锁
     LL_IWDG_SetPrescaler(IWDG, LL_IWDG_PRESCALER_256); // 分频 32kHz/256=125Hz
-    LL_IWDG_SetReloadCounter(IWDG, 250);              //  重载值 250/125=2s
+    /*
+     * 重载值 400/125Hz = 3.2s。
+     * 不能设成 2s：Flash 擦写期间 CPU 被 flash busy 阻塞，TIM6 喂狗中断停摆，
+     * 而 F407 单个 128KB 扇区擦除 max 可达 2.6s，2s 超时会在擦除中途误触发复位。
+     * 3.2s 覆盖 2.6s + 余量，代价仅是应用崩溃后回滚检测稍慢 ~1.2s。
+     */
+    LL_IWDG_SetReloadCounter(IWDG, 400);              //  3.2s
 
     timeout = 1000000;
     while (!LL_IWDG_IsReady(IWDG) && timeout-- > 0) {} // 等 PR/RLR 写入完成
@@ -719,9 +724,11 @@ void bootloader_main(void)
     if (!trapboot)
     {
         boot_state_t st = boot_state_read();
+
         if (LL_RCC_IsActiveFlag_IWDGRST())
         {
             LL_RCC_ClearResetFlags();
+            /* 看门狗复位 = 上次启动的应用崩溃，累计连续崩溃次数 */
             if (st.boot_attempts < 3)
             {
                 st.boot_attempts++;
@@ -729,14 +736,36 @@ void bootloader_main(void)
             }
             else
             {
+                /* 连续 3 次崩溃：当前 active 槽判定为坏，回滚到另一槽 */
                 st.active_slot = (st.active_slot == BOOT_SLOT_A) ? BOOT_SLOT_B : BOOT_SLOT_A;
                 st.pending_slot = BOOT_PENDING_NONE;
                 st.boot_attempts = 0;
                 log_w("3rd IWDG reset, auto-switch to slot %d", st.active_slot);
             }
-            st.crc32 = crc32((uint8_t *)&st, offset_of(boot_state_t, crc32));
             boot_state_write(&st);
         }
+        else
+        {
+            LL_RCC_ClearResetFlags();
+            /* 正常复位(上电/软复位/外部复位)：清零连续崩溃计数 */
+            if (st.boot_attempts != 0)
+            {
+                st.boot_attempts = 0;
+                boot_state_write(&st);
+            }
+        }
+
+        /* 有待切换槽位：乐观提交为 active。
+           这样 INQUERY 状态里的 active_slot 才是实际运行槽；
+           且新槽若连续崩溃 3 次，回滚方向才能正确回到旧槽。 */
+        if (st.pending_slot != BOOT_PENDING_NONE)
+        {
+            st.active_slot = st.pending_slot;
+            st.pending_slot = BOOT_PENDING_NONE;
+            st.boot_attempts = 0;
+            boot_state_write(&st);
+        }
+
         boot_slot_t slot = select_boot_slot(&st);
         if (slot != BOOT_PENDING_NONE && try_boot_slot(slot))
         {

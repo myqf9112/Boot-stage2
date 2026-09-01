@@ -3,4 +3,10 @@ tools/gcc-arm-none-eabi/
 weatherclock/
 tools/sync_host_to_desktop.sh/
 上位机源码/sync_to_windows.sh/
-上位机源码/watch_sync.sh/上位机源码/__pycache__/
+上位机源码/watch_sync.sh/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+dist/

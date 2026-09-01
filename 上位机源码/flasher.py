@@ -26,7 +26,7 @@ BL_ADDRESS         = 0x08000000
 BL_SIZE            = 32 * 1024      # bootloader (sectors 0-1)
 STATE_ADDRESS      = 0x08008000     # boot state (sector 2)
 
-# 槽位配置（必须与 bootloader.c 分区表一致）
+# 槽位配置
 SLOTS = {
     'A': {
         'header_addr': 0x0800C000,   # A_Hdr (sector 3, 16KB)
@@ -387,6 +387,7 @@ def flash_firmware(
     skip_verify: bool = False,
     resume: bool = False,
     switch_after: bool = True,
+    dedup: bool = True,
 ) -> None:
     """
     Complete firmware flash workflow:
@@ -406,6 +407,8 @@ def flash_firmware(
       resume:       Resume from <bin>.resume.json checkpoint if valid
       switch_after: After flash, switch to this slot and reset (default True).
                     Set False to just send BOOT (legacy behavior).
+      dedup:        If True (default), skip erase/program when target slot
+                    already holds the same firmware (CRC match).
     """
 
     _t0 = time.time()
@@ -481,7 +484,19 @@ def flash_firmware(
         print("  (INQUERY not supported, using defaults)")
         actual_chunk = CHUNK_SIZE
 
-    # ---- 3. ERASE (combined: header + APP, sector-safe) ----
+    # ---- 3. Dedup probe: skip erase/program if target already holds this firmware ----
+    dedup_hit = False
+    if dedup and not skip_erase and resume_stage is None:
+        try:
+            probe = struct.pack('<III', data_address, data_length, fw_crc32)
+            errcode, _ = send_and_recv(ser, OPCODE_VERIFY, probe, debug_cb=lambda _m: None)
+            dedup_hit = (errcode == ERR_OK)
+            if dedup_hit:
+                print(f"  Firmware unchanged (CRC 0x{fw_crc32:08X} match), skip erase/program")
+        except Exception:
+            dedup_hit = False
+
+    # ---- 4. ERASE (combined: header + APP, sector-safe) ----
     erase_start = min(header_addr, data_address)
     erase_end = max(header_addr + len(header_bytes), data_address + data_length)
     erase_size = erase_end - erase_start
@@ -490,6 +505,8 @@ def flash_firmware(
         print("ERASE: SKIPPED (--skip-erase)")
     elif resume_stage is not None:
         print("ERASE: SKIPPED (resuming, flash already erased)")
+    elif dedup_hit:
+        print("ERASE: SKIPPED (firmware unchanged)")
     else:
         print(f"Erasing 0x{erase_start:08X} +{erase_size} (header + APP)...")
         erase(ser, erase_start, erase_size)
@@ -497,8 +514,10 @@ def flash_firmware(
         # 擦除完成才落盘:之后续传绝不再擦除
         _save_checkpoint(bin_path, "erased", 0, data_address, data_length, firmware)
 
-    # ---- 4. PROGRAM Magic Header ----
-    if resume_stage in ("header_done", "firmware"):
+    # ---- 5. PROGRAM Magic Header ----
+    if dedup_hit:
+        print("Header: SKIPPED (firmware unchanged)")
+    elif resume_stage in ("header_done", "firmware"):
         print("Header: SKIPPED (resuming, already programmed)")
     else:
         print(f"Programming magic header to 0x{header_addr:08X} ({len(header_bytes)} B)...")
@@ -510,43 +529,48 @@ def flash_firmware(
         print("  Header: OK")
         _save_checkpoint(bin_path, "header_done", 0, data_address, data_length, firmware)
 
-    # ---- 5. PROGRAM Firmware (chunked, pipelined) ----
-    start_offset = resume_offset if resume_stage == "firmware" else 0
-    if start_offset:
-        print(f"Resuming firmware from offset {start_offset} / {data_length}")
-    print(f"Programming firmware ({actual_chunk} B/chunk, pipelined)...")
+    # ---- 6. PROGRAM Firmware (chunked, pipelined) ----
     total = data_length
-    chunks = [
-        (data_address + off, firmware[off:off + actual_chunk])
-        for off in range(start_offset, total, actual_chunk)
-    ]
+    if dedup_hit:
+        print("Firmware: SKIPPED (unchanged)")
+    else:
+        start_offset = resume_offset if resume_stage == "firmware" else 0
+        if start_offset:
+            print(f"Resuming firmware from offset {start_offset} / {data_length}")
+        print(f"Programming firmware ({actual_chunk} B/chunk, pipelined)...")
+        chunks = [
+            (data_address + off, firmware[off:off + actual_chunk])
+            for off in range(start_offset, total, actual_chunk)
+        ]
 
-    saved_offset = start_offset
+        saved_offset = start_offset
 
-    def _on_ack(done):
-        nonlocal saved_offset
-        saved_offset = start_offset + done
-        _progress_bar(saved_offset, total, prefix="  ")
-        _save_checkpoint(bin_path, "firmware", saved_offset,
-                         data_address, data_length, firmware)
+        def _on_ack(done):
+            nonlocal saved_offset
+            saved_offset = start_offset + done
+            _progress_bar(saved_offset, total, prefix="  ")
+            _save_checkpoint(bin_path, "firmware", saved_offset,
+                             data_address, data_length, firmware)
 
-    try:
-        program_stream(ser, chunks, progress_cb=_on_ack)
-    except Exception as e:
-        print(f"\n  PROGRAM failed: {e}")
-        print(f"  (progress saved at {saved_offset}, re-run with --resume to continue)")
-        raise
-    print()  # newline
+        try:
+            program_stream(ser, chunks, progress_cb=_on_ack)
+        except Exception as e:
+            print(f"\n  PROGRAM failed: {e}")
+            print(f"  (progress saved at {saved_offset}, re-run with --resume to continue)")
+            raise
+        print()  # newline
 
-    # ---- 6. VERIFY ----
+    # ---- 7. VERIFY ----
     if skip_verify:
         print("VERIFY: SKIPPED (--skip-verify)")
+    elif dedup_hit:
+        print("VERIFY: SKIPPED (CRC already matched)")
     else:
         print(f"Verifying firmware 0x{data_address:08X} size={total}...")
         verify(ser, data_address, total, fw_crc32)
         print(f"VERIFY: OK (CRC32 = 0x{fw_crc32:08X})")
 
-    # ---- 7. Switch & reboot / boot ----
+    # ---- 8. Switch & reboot / boot ----
     if switch_after:
         print(f"Switching to slot {s} (pending_slot={0 if s == 'A' else 1})...")
         switch_slot(ser, s)

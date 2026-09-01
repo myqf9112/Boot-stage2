@@ -67,6 +67,11 @@ bool stm32_flash_erase(uint32_t address, uint32_t size)
 }
 bool stm32_flash_program(uint32_t address, const uint8_t *data, uint32_t size)
 {
+    if (size % 4 != 0)
+    {
+        log_e("program size %lu is not 4-byte aligned", size);
+        return false;
+    }
 
     bool ok = true;
     for (uint32_t i = 0; i < size; i += 4)
@@ -77,6 +82,15 @@ bool stm32_flash_program(uint32_t address, const uint8_t *data, uint32_t size)
         {
             log_w("failed to program word at address 0x%08lx", address + i);
             ok = false;
+            break;
+        }
+        /* 写后回读校验，确保数据真实落盘 */
+        if (*(volatile uint32_t *)(address + i) != word)
+        {
+            log_w("verify failed at address 0x%08lx: wrote %08lx, read %08lx",
+                  address + i, word, *(volatile uint32_t *)(address + i));
+            ok = false;
+            break;
         }
     }
     return ok;

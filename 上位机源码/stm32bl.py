@@ -132,6 +132,8 @@ Examples:
                         help="Resume from .resume.json checkpoint if available")
     parser.add_argument("--no-switch", action="store_true",
                         help="After flash, do NOT switch slot/reset (just send BOOT)")
+    parser.add_argument("--force", action="store_true",
+                        help="Disable dedup: always erase and reprogram (even if CRC matches)")
     parser.add_argument("--list", action="store_true",
                         help="List available serial ports")
 
@@ -173,6 +175,7 @@ Examples:
                 skip_verify=args.skip_verify,
                 resume=args.resume,
                 switch_after=not args.no_switch,
+                dedup=not args.force,
             )
         elif args.action == "inquery":
             cmd_inquery(ser)
