@@ -84,8 +84,8 @@ graph TD
 帧格式（上位机 → Bootloader，请求头 `0xAA`；Bootloader → 上位机，响应头 `0x55`）：
 
 ```
-请求: 0xAA | opcode(1) | length(2,大端) | payload(length) | CRC16(2)
-响应: 0x55 | opcode(1) | errcode(1)     | length(2,大端)   | payload(length) | CRC16(2)
+请求: 0xAA | opcode(1) | length(2,小端) | payload(length) | CRC16(2,小端)
+响应: 0x55 | opcode(1) | errcode(1)     | length(2,小端)   | payload(length) | CRC16(2,小端)
 ```
 
 CRC16 采用 XMODEM（poly=0x1021，init=0x0000，不反转）；CRC32 采用 IEEE 802.3（同 `zlib.crc32`）。
