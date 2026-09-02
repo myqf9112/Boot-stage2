@@ -141,7 +141,4 @@ python stm32bl.py COM3 reset                         # 系统复位
 
 ![效果图占位](docs/images/demo.png)
 
-> 图片请放入 `docs/images/` 目录，并在上方替换 `demo.png` 为实际文件名。
-> 支持放置：上位机 GUI 截图、烧录过程截图、硬件实物图、回滚演示动图等。
-
 
