@@ -5,14 +5,14 @@
 
 ## 特性
 
-- 🚀 **A/B 双槽位**：A 槽 448KB、B 槽 508KB，升级失败自动回滚
-- 🛡️ **看门狗自动回滚**：新固件连续 3 次崩溃（IWDG 复位）自动翻回旧槽
-- ✅ **三重校验**：Magic Header CRC32 + 固件 CRC32 + 写后回读校验
-- 🔒 **Flash 写保护**：`flash_range_check` 硬校验，防止 `uint32` 溢出绕过 Bootloader 写保护
-- ⚡ **流水线烧录**：DMA 接收 + 分块流水线编程，2Mbps 波特率高速烧录
-- 🔁 **断点续传**：烧录中断后从 `.resume.json` 检查点继续
-- 🎯 **固件去重**：烧录前探测目标槽 CRC，一致则跳过擦写（`--force` 强制重烧）
-- 🖥️ **上位机工具**：Python CLI + GUI 图形界面
+-  **A/B 双槽位**：A 槽 448KB、B 槽 508KB，升级失败自动回滚
+-  **看门狗自动回滚**：新固件连续 3 次崩溃（IWDG 复位）自动翻回旧槽
+-  **三重校验**：Magic Header CRC32 + 固件 CRC32 + 写后回读校验
+-  **Flash 写保护**：`flash_range_check` 硬校验，防止 `uint32` 溢出绕过 Bootloader 写保护
+-  **流水线烧录**：DMA 接收 + 分块流水线编程，2Mbps 波特率高速烧录
+-  **断点续传**：烧录中断后从 `.resume.json` 检查点继续
+-  **固件去重**：烧录前探测目标槽 CRC，一致则跳过擦写（`--force` 强制重烧）
+-  **上位机工具**：Python CLI + GUI 图形界面
 
 ## Flash 分区表
 
@@ -144,6 +144,4 @@ python stm32bl.py COM3 reset                         # 系统复位
 > 图片请放入 `docs/images/` 目录，并在上方替换 `demo.png` 为实际文件名。
 > 支持放置：上位机 GUI 截图、烧录过程截图、硬件实物图、回滚演示动图等。
 
-## License
 
-MIT License（如适用）。
