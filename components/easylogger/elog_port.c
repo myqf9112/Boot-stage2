@@ -2,6 +2,7 @@
 #include <elog.h>
 #include "tim_delay.h"
 #include "console.h"
+#include <inttypes.h>
 #include <string.h>
 #include <stdio.h>
 ElogErrCode elog_port_init(void)
@@ -28,12 +29,13 @@ const char *elog_port_get_time(void)
 {
     static char time_str[16] = {0};
     uint64_t total_ms = tim_get_ms();
-    uint32_t ms = total_ms % (3600 * 1000);      // 1Ğ¡Ê±ÄÚµÄºÁÃëÊı
-    uint32_t fmt_mm = ms / (60 * 1000);          // ·ÖÖÓ
-    uint32_t fmt_ss = (ms % (60 * 1000)) / 1000; // Ãë
-    uint32_t fmt_ms = ms % 1000;                 // ºÁÃë
+    uint32_t ms = total_ms % (3600 * 1000);      // 1å°æ—¶å†…çš„æ¯«ç§’æ•°
+    uint32_t fmt_mm = ms / (60 * 1000);          // åˆ†é’Ÿ
+    uint32_t fmt_ss = (ms % (60 * 1000)) / 1000; // ç§’
+    uint32_t fmt_ms = ms % 1000;                 // æ¯«ç§’
 
-    snprintf(time_str, sizeof(time_str), "%02u:%02u:%03u", fmt_mm, fmt_ss, fmt_ms);
+    snprintf(time_str, sizeof(time_str), "%02" PRIu32 ":%02" PRIu32 ":%03" PRIu32,
+             fmt_mm, fmt_ss, fmt_ms);
     return time_str;
 }
 

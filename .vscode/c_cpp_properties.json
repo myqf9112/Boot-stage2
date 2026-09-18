@@ -23,7 +23,7 @@
             "compilerPath": "${workspaceFolder}/tools/gcc-arm-none-eabi/10.3/bin/arm-none-eabi-gcc",
             "intelliSenseMode": "linux-gcc-arm",
             "cStandard": "c11",
-            "cppStandard": "gnu++11",
+            "cppStandard": "c++11",
             "mergeConfigurations": true
         }
     ],

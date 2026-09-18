@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "../../.."
+		},
+		{
+			"path": "../../../../WeatherClock"
+		}
+	],
+	"settings": {
+		"encoding-guard.patternMap": {
+			".c": "gb2312"
+		}
+	}
+}

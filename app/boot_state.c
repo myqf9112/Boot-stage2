@@ -5,10 +5,10 @@
 #include <stdbool.h>
 #include "utils.h"
 #include "stm32flash.h"
-#include "elog.h"
 
 #define LOG_TAG "boot_state"
 #define LOG_LVL ELOG_LVL_INFO
+#include "elog.h"
 
 bool boot_state_validate(const boot_state_t *state)
 {
