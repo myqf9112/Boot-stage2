@@ -1,6 +1,6 @@
 #!/bin/bash
 # 上位机源码 → Windows 桌面 同步脚本
-# 只同步顶层 .py / .txt / .bat 文件，忽略 __pycache__/.venv/dist
+# 同步顶层源码文件，并把打包后的 STM32BL_Tool.exe 放到目标目录根部
 # 无变更时静默，有变更时打印变更文件
 SRC="/home/myqx9112/BOOT2026/上位机源码"
 DST="/mnt/e/Desktop/BOOT2026_上位机"
@@ -20,8 +20,19 @@ changes=$(rsync -rlti \
   --exclude='*' \
   "$SRC/" "$DST/" 2>/dev/null | grep -vE '^\.d')
 
+# dist 目录不整体同步，只发布最终可执行文件，桌面上可以直接双击新版工具。
+exe_changes=""
+if [ -f "$SRC/dist/STM32BL_Tool.exe" ]; then
+    exe_changes=$(rsync -lti \
+      --no-perms --no-owner --no-group \
+      "$SRC/dist/STM32BL_Tool.exe" "$DST/" 2>/dev/null)
+fi
+
+if [ -n "$exe_changes" ]; then
+    changes="${changes}${changes:+$'\n'}${exe_changes}"
+fi
+
 if [ -n "$changes" ]; then
     echo "[sync] $(date '+%H:%M:%S')"
     echo "$changes" | sed 's/^/  /'
 fi
-

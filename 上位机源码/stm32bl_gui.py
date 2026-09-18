@@ -51,6 +51,8 @@ class FlashWorker(threading.Thread):
             # ---- Read and parse file ----
             if not os.path.exists(self.bin_path):
                 raise FileNotFoundError("File not found: " + self.bin_path)
+            if os.path.basename(self.bin_path).lower().endswith('_header.bin'):
+                raise ValueError("请选择 WeatherClock_A.bin/WeatherClock_B.bin，不能把 Header 文件当作固件烧录")
             with open(self.bin_path, 'rb') as f:
                 raw_data = f.read()
 
@@ -92,6 +94,24 @@ class FlashWorker(threading.Thread):
             firmware = _align4(firmware)
             data_length = len(firmware)
             fw_crc32 = crc32(firmware)
+            if ext != '.xbin':
+                # Header 必须描述实际写入 Flash 的补齐后数据。
+                header_bytes = generate_magic_header(firmware, slot=s)
+            elif data_length != struct.unpack_from('<I', header_bytes, 44)[0]:
+                raise ValueError(".xbin firmware must be 4-byte aligned")
+
+            slot_end = slot_cfg['slot_addr'] + slot_cfg['slot_size']
+            if header_addr != slot_cfg['header_addr']:
+                raise ValueError(
+                    "Header address 0x%08X does not match slot %s" % (header_addr, s)
+                )
+            if data_address != slot_cfg['app_addr'] or data_length > slot_cfg['app_size']:
+                raise ValueError(
+                    "Image does not fit slot %s: address=0x%08X, size=%d B, limit=%d B" %
+                    (s, data_address, data_length, slot_cfg['app_size'])
+                )
+            if data_address + data_length > slot_end:
+                raise ValueError("Firmware crosses slot %s end 0x%08X" % (s, slot_end))
             self._log("  Firmware size: %d B (%.1f KB)" % (data_length, data_length / 1024))
 
             resume_stage = None
@@ -116,41 +136,21 @@ class FlashWorker(threading.Thread):
                 self._log("  (using default chunk size)")
                 actual_chunk = CHUNK_SIZE
 
-            # ---- ERASE (combined: header + APP) ----
-            erase_start = min(header_addr, data_address)
-            erase_end = max(header_addr + len(header_bytes), data_address + data_length)
-            erase_size = erase_end - erase_start
+            # ---- ERASE complete slot on physical sector boundaries ----
+            erase_start = slot_cfg['slot_addr']
+            erase_size = slot_cfg['slot_size']
             if self.skip_erase:
                 self._log("ERASE: SKIPPED")
             elif resume_stage is not None:
                 self._log("ERASE: SKIPPED (resuming, flash already erased)")
             else:
-                self._log("Erasing 0x%08X +%d (header + APP)..." % (erase_start, erase_size))
+                self._log("Erasing complete slot %s: 0x%08X +%d..." %
+                          (s, erase_start, erase_size))
                 payload = struct.pack('<II', erase_start, erase_size)
                 errcode, _ = send_and_recv(ser, OPCODE_ERASE, payload)
                 self._check_errcode(errcode, "ERASE")
                 self._log("  Erase: OK (synchronous erase complete)")
                 _save_checkpoint(self.bin_path, "erased", 0, data_address, data_length, firmware)
-
-            # ---- PROGRAM Magic Header ----
-            if resume_stage in ("header_done", "firmware"):
-                self._log("Header: SKIPPED (resuming, already programmed)")
-            else:
-                self._log("Programming magic header to 0x%08X (%d B)..." % (header_addr, len(header_bytes)))
-                hdr_offset = 0
-                while hdr_offset < len(header_bytes) and not self._cancel:
-                    chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
-                    payload = struct.pack('<II', header_addr + hdr_offset, len(chunk)) + chunk
-                    errcode, _ = send_and_recv(ser, OPCODE_PROGRAM, payload)
-                    self._check_errcode(errcode, "PROGRAM HEADER")
-                    hdr_offset += len(chunk)
-                self._log("  Header: OK")
-                _save_checkpoint(self.bin_path, "header_done", 0, data_address, data_length, firmware)
-
-            if self._cancel:
-                self._log("CANCELLED")
-                self.q.put((MSG_DONE, False, "Cancelled"))
-                return
 
             # ---- PROGRAM Firmware (pipelined) ----
             start_offset = resume_offset if resume_stage == "firmware" else 0
@@ -188,6 +188,22 @@ class FlashWorker(threading.Thread):
                 errcode, _ = send_and_recv(ser, OPCODE_VERIFY, payload)
                 self._check_errcode(errcode, "VERIFY")
                 self._log("VERIFY: OK (CRC32=0x%08X)" % fw_crc32)
+
+            # ---- PROGRAM Magic Header last: atomic slot commit ----
+            self._log("Programming magic header last to 0x%08X (%d B)..." %
+                      (header_addr, len(header_bytes)))
+            hdr_offset = 0
+            while hdr_offset < len(header_bytes) and not self._cancel:
+                chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
+                payload = struct.pack('<II', header_addr + hdr_offset, len(chunk)) + chunk
+                errcode, _ = send_and_recv(ser, OPCODE_PROGRAM, payload)
+                self._check_errcode(errcode, "PROGRAM HEADER")
+                hdr_offset += len(chunk)
+            if self._cancel:
+                self._log("CANCELLED before slot commit")
+                self.q.put((MSG_DONE, False, "Cancelled"))
+                return
+            self._log("  Header: OK (slot committed)")
 
             # ---- Switch & reset (boot into the newly-flashed slot) ----
             self._log("Switching to slot %s..." % s)
