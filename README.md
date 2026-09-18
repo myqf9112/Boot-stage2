@@ -5,7 +5,7 @@
 
 ## 特性
 
--  **A/B 双槽位**：A 槽 448KB、B 槽 508KB，升级失败自动回滚
+-  **A/B 双槽位**：两个槽均从物理扇区边界开始，升级失败自动回滚
 -  **看门狗自动回滚**：新固件连续 3 次崩溃（IWDG 复位）自动翻回旧槽
 -  **三重校验**：Magic Header CRC32 + 固件 CRC32 + 写后回读校验
 -  **Flash 写保护**：`flash_range_check` 硬校验，防止 `uint32` 溢出绕过 Bootloader 写保护
@@ -20,10 +20,10 @@
 |------|----------|------|------|
 | Bootloader | `0x08000000` | 32KB（Sector 0~1） | 本工程 |
 | Boot State | `0x08008000` | 16KB（Sector 2） | A/B 状态持久化 |
-| A 槽 Header | `0x0800C000` | 16KB（Sector 3） | A 槽 Magic Header |
-| A 槽 APP | `0x08010000` | 448KB（Sector 4~7） | A 槽应用 |
-| B 槽 Header | `0x08080000` | 4KB（Sector 8 起始） | B 槽 Magic Header |
-| B 槽 APP | `0x08081000` | 508KB（Sector 8 尾~11） | B 槽应用 |
+| A 槽 | `0x0800C000` | 464KB（Sector 3~7） | Header 位于槽首，APP 从 `0x0800C200` 开始 |
+| B 槽 | `0x08080000` | 512KB（Sector 8~11） | Header 位于槽首，APP 从 `0x08080200` 开始 |
+
+每个槽首保留 `0x200` 字节作为提交清单区域，APP 向量表保持 `0x200` 对齐。更新时完整擦除非活动槽，先写并校验 APP，最后写入 256 字节 Magic Header；掉电发生在 Header 提交前时，该槽仍会被 Bootloader 判定为无效。
 
 ## 目录结构
 
@@ -140,5 +140,4 @@ python stm32bl.py COM3 reset                         # 系统复位
 ## 效果图
 
 ![效果图占位](docs/images/demo.png)
-
 

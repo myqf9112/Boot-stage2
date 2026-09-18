@@ -36,17 +36,17 @@
 /*
 Bootloader : 0x08000000  32KB  (sector 0~1)
 Boot State : 0x08008000  16KB  (sector 2)
-A Header   : 0x0800C000  16KB  (sector 3)
-A App      : 0x08010000  448KB (sector 4~7)
-B Header   : 0x08080000  4KB   (sector 8 起始)
-B App      : 0x08081000  508KB (sector 8 尾~11)
+A Slot     : 0x0800C000  464KB (sector 3~7, header 0x0800C000, app 0x0800C200)
+B Slot     : 0x08080000  512KB (sector 8~11, header 0x08080000, app 0x08080200)
 */
-#define APP_BASE_ADDRESS 0x08010000
 #define BL_ADDRESS 0x08000000
 #define BL_SIZE (32 * 1024)              // 32KB bootloader size
 #define A_MAGICHEADER_ADDRESS 0x0800C000 // A槽magic header存储地址
 #define B_MAGICHEADER_ADDRESS 0x08080000 // B槽magic header存储地址
-#define B_APP_ADDRESS 0x08081000         // B槽应用程序存储地址
+#define A_APP_ADDRESS 0x0800C200         // A槽向量表，0x200 对齐
+#define B_APP_ADDRESS 0x08080200         // B槽向量表，0x200 对齐
+#define A_SLOT_END 0x08080000            // A槽末地址（开区间）
+#define B_SLOT_END 0x08100000            // B槽末地址（开区间）
 
 typedef enum
 {
@@ -119,6 +119,18 @@ static uint32_t slot_header_address(boot_slot_t slot)
     }
 }
 
+static uint32_t slot_app_address(boot_slot_t slot)
+{
+    return (slot == BOOT_SLOT_A) ? A_APP_ADDRESS :
+           (slot == BOOT_SLOT_B) ? B_APP_ADDRESS : 0;
+}
+
+static uint32_t slot_end_address(boot_slot_t slot)
+{
+    return (slot == BOOT_SLOT_A) ? A_SLOT_END :
+           (slot == BOOT_SLOT_B) ? B_SLOT_END : 0;
+}
+
 static bool slot_validate(boot_slot_t slot)
 {
     uint32_t header_address = slot_header_address(slot);
@@ -138,6 +150,28 @@ static bool slot_validate(boot_slot_t slot)
     uint32_t addr = magic_header_get_address(header_address);
     uint32_t size = magic_header_get_length(header_address);
     uint32_t stored_crc = magic_header_get_crc32(header_address);
+    uint32_t expected_addr = slot_app_address(slot);
+    uint32_t slot_end = slot_end_address(slot);
+
+    if (magic_header_get_type(header_address) != MAGIC_HEADER_TYPE_APP ||
+        addr != expected_addr || size < 8 || size > slot_end - expected_addr)
+    {
+        log_w("Slot %d image range invalid: addr=0x%08X size=%u", slot, addr, size);
+        return false;
+    }
+
+    uint32_t initial_sp = *(const uint32_t *)addr;
+    uint32_t reset_handler = *(const uint32_t *)(addr + 4);
+    if ((initial_sp & 7U) != 0 ||
+        initial_sp <= 0x20000000U || initial_sp > 0x20020000U ||
+        (reset_handler & 1U) == 0 ||
+        (reset_handler & ~1U) < addr || (reset_handler & ~1U) >= addr + size)
+    {
+        log_w("Slot %d vector table invalid: SP=0x%08X reset=0x%08X",
+              slot, initial_sp, reset_handler);
+        return false;
+    }
+
     uint32_t calc_crc = crc32((const uint8_t *)addr, size);
 
     if (stored_crc != calc_crc)

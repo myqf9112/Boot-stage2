@@ -29,14 +29,18 @@ STATE_ADDRESS      = 0x08008000     # boot state (sector 2)
 # 槽位配置
 SLOTS = {
     'A': {
-        'header_addr': 0x0800C000,   # A_Hdr (sector 3, 16KB)
-        'app_addr':    0x08010000,   # A_App (sectors 4-7, 448KB)
-        'app_size':    448 * 1024,
+        'slot_addr':   0x0800C000,   # sectors 3-7
+        'slot_size':   464 * 1024,
+        'header_addr': 0x0800C000,
+        'app_addr':    0x0800C200,   # VTOR 0x200 aligned
+        'app_size':    464 * 1024 - 0x200,
     },
     'B': {
-        'header_addr': 0x08080000,   # B_Hdr (sector 8 起始, 4KB)
-        'app_addr':    0x08081000,   # B_App (sector 8 尾 + 9-11, 508KB)
-        'app_size':    508 * 1024,
+        'slot_addr':   0x08080000,   # sectors 8-11
+        'slot_size':   512 * 1024,
+        'header_addr': 0x08080000,
+        'app_addr':    0x08080200,   # VTOR 0x200 aligned
+        'app_size':    512 * 1024 - 0x200,
     },
 }
 
@@ -206,14 +210,14 @@ def reset(ser: serial.Serial) -> None:
 #   offset  4: bitmask      (4B)
 #   offset  8: reserved1    (24B)
 #   offset 32: data_type    (4B)
-#   offset 36: data_offset  (4B)  = 4096
-#   offset 40: data_address (4B)  = 0x08010000
+#   offset 36: data_offset  (4B)  = 0
+#   offset 40: data_address (4B)  = slot base + 0x200
 #   offset 44: data_length  (4B)  firmware size
 #   offset 48: data_crc32   (4B)  firmware CRC32
 #   offset 52: reserved2    (44B)
 #   offset 96: version      (128B) version string
 #   offset224: reserved3    (24B)
-#   offset248: this_address (4B)  = 0x0800C000
+#   offset248: this_address (4B)  = slot base
 #   offset252: this_crc32   (4B)  header self CRC32
 
 
@@ -359,7 +363,7 @@ def _load_checkpoint(bin_path, firmware, data_address, data_length):
     if cp.get("data_address") != data_address or cp.get("data_length") != data_length:
         return None
     stage = cp.get("stage")
-    if stage not in ("erased", "header_done", "firmware"):
+    if stage not in ("erased", "firmware"):
         return None
     try:
         offset = int(cp.get("offset", 0))
@@ -392,10 +396,11 @@ def flash_firmware(
     """
     Complete firmware flash workflow:
       1. Read file (.bin or .xbin), parse/auto-generate magic header
-      2. ERASE header + APP region (combined, sector-safe)
-      3. PROGRAM: magic header to header_addr, firmware to APP address
-      4. VERIFY: firmware CRC32
-      5. SWITCH_SLOT + RESET (default) or BOOT
+      2. ERASE complete target slot on sector boundaries
+      3. PROGRAM firmware to APP address
+      4. VERIFY firmware CRC32
+      5. PROGRAM magic header last (atomic slot commit)
+      6. SWITCH_SLOT + RESET (default) or BOOT
 
     Args:
       ser:          Open serial port object
@@ -455,12 +460,25 @@ def flash_firmware(
 
     # Recalculate CRC32 on padded firmware
     fw_crc32 = crc32(firmware)
+    if file_type != 'xbin':
+        # Header must describe the exact padded bytes that will be programmed.
+        header_bytes = generate_magic_header(firmware, slot=s)
+    elif data_length != struct.unpack_from('<I', header_bytes, 44)[0]:
+        raise ValueError(".xbin firmware must be 4-byte aligned")
 
-    # 边界检查：不能超出槽位大小
-    if data_address >= slot_cfg['app_addr'] and data_length > slot_cfg['app_size']:
+    # 分区契约检查：header/app 必须属于所选槽，镜像不能越过槽尾。
+    slot_end = slot_cfg['slot_addr'] + slot_cfg['slot_size']
+    if header_addr != slot_cfg['header_addr']:
         raise ValueError(
-            f"Firmware too large for slot {s}: {data_length} B > {slot_cfg['app_size']} B"
+            f"Header address 0x{header_addr:08X} does not match slot {s}"
         )
+    if data_address != slot_cfg['app_addr'] or data_length > slot_cfg['app_size']:
+        raise ValueError(
+            f"Image does not fit slot {s}: address=0x{data_address:08X}, "
+            f"size={data_length} B, limit={slot_cfg['app_size']} B"
+        )
+    if data_address + data_length > slot_end:
+        raise ValueError(f"Firmware crosses slot {s} end 0x{slot_end:08X}")
 
     # ---- Resume checkpoint ----
     resume_stage = None
@@ -496,10 +514,9 @@ def flash_firmware(
         except Exception:
             dedup_hit = False
 
-    # ---- 4. ERASE (combined: header + APP, sector-safe) ----
-    erase_start = min(header_addr, data_address)
-    erase_end = max(header_addr + len(header_bytes), data_address + data_length)
-    erase_size = erase_end - erase_start
+    # ---- 4. ERASE complete inactive slot on physical sector boundaries ----
+    erase_start = slot_cfg['slot_addr']
+    erase_size = slot_cfg['slot_size']
 
     if skip_erase:
         print("ERASE: SKIPPED (--skip-erase)")
@@ -508,28 +525,13 @@ def flash_firmware(
     elif dedup_hit:
         print("ERASE: SKIPPED (firmware unchanged)")
     else:
-        print(f"Erasing 0x{erase_start:08X} +{erase_size} (header + APP)...")
+        print(f"Erasing complete slot {s}: 0x{erase_start:08X} +{erase_size}...")
         erase(ser, erase_start, erase_size)
         print("  Erase: ACK (synchronous erase complete)")
         # 擦除完成才落盘:之后续传绝不再擦除
         _save_checkpoint(bin_path, "erased", 0, data_address, data_length, firmware)
 
-    # ---- 5. PROGRAM Magic Header ----
-    if dedup_hit:
-        print("Header: SKIPPED (firmware unchanged)")
-    elif resume_stage in ("header_done", "firmware"):
-        print("Header: SKIPPED (resuming, already programmed)")
-    else:
-        print(f"Programming magic header to 0x{header_addr:08X} ({len(header_bytes)} B)...")
-        hdr_offset = 0
-        while hdr_offset < len(header_bytes):
-            chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
-            program(ser, header_addr + hdr_offset, chunk)
-            hdr_offset += len(chunk)
-        print("  Header: OK")
-        _save_checkpoint(bin_path, "header_done", 0, data_address, data_length, firmware)
-
-    # ---- 6. PROGRAM Firmware (chunked, pipelined) ----
+    # ---- 5. PROGRAM Firmware (chunked, pipelined) ----
     total = data_length
     if dedup_hit:
         print("Firmware: SKIPPED (unchanged)")
@@ -560,7 +562,7 @@ def flash_firmware(
             raise
         print()  # newline
 
-    # ---- 7. VERIFY ----
+    # ---- 6. VERIFY ----
     if skip_verify:
         print("VERIFY: SKIPPED (--skip-verify)")
     elif dedup_hit:
@@ -569,6 +571,18 @@ def flash_firmware(
         print(f"Verifying firmware 0x{data_address:08X} size={total}...")
         verify(ser, data_address, total, fw_crc32)
         print(f"VERIFY: OK (CRC32 = 0x{fw_crc32:08X})")
+
+    # ---- 7. PROGRAM Magic Header last: this commits the slot atomically ----
+    if dedup_hit:
+        print("Header: SKIPPED (firmware unchanged)")
+    else:
+        print(f"Programming magic header last to 0x{header_addr:08X} ({len(header_bytes)} B)...")
+        hdr_offset = 0
+        while hdr_offset < len(header_bytes):
+            chunk = header_bytes[hdr_offset:hdr_offset + actual_chunk]
+            program(ser, header_addr + hdr_offset, chunk)
+            hdr_offset += len(chunk)
+        print("  Header: OK (slot committed)")
 
     # ---- 8. Switch & reboot / boot ----
     if switch_after:

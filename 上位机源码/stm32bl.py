@@ -4,7 +4,7 @@
 #   python stm32bl.py COM3 flash firmware.bin --slot A    # Flash to Slot A (auto header)
 #   python stm32bl.py COM3 flash firmware.bin --slot B    # Flash to Slot B
 #   python stm32bl.py COM3 flash firmware.xbin            # Flash .xbin (with magic header)
-#   python stm32bl.py COM3 flash firmware.bin --slot B --addr 0x08081000
+#   python stm32bl.py COM3 flash firmware.bin --slot B --addr 0x08080200
 #   python stm32bl.py COM3 inquery                    # Query version/MTU
 #   python stm32bl.py COM3 status                     # Query A/B slot status
 #   python stm32bl.py COM3 switch --slot B            # Switch boot slot (pending)
